@@ -1,179 +1,154 @@
 """
-実用系 Discord Bot - スラッシュコマンド対応版
-プログラミング基礎 最終課題
+数値データの解析とグラフ生成をまとめたモジュール。
+/boxplot, /hist などのスラッシュコマンドから利用する。
 
-新しいスラッシュコマンドを追加する手順:
-  1. このファイルに @bot.tree.command(...) で関数を追加する
-  2. Bot を再起動する
-  3. GUILD_ID を設定していれば即座に、未設定ならグローバル同期
-     (反映まで最大1時間かかることがある)でDiscord側に反映される
+第9回(グラフ)・第11回(統計)の内容をベースにしている。
 """
 
-import os
-from typing import Optional
+import io
+from typing import List, Optional
 
 import discord
-from discord import app_commands
-from discord.ext import commands
+import matplotlib
 
-from charts import (
-    DataParseError,
-    compute_basic_stats,
-    create_boxplot_image,
-    create_histogram_image,
-    parse_number_input,
-)
-from keep_alive import keep_alive
-
-# ============================================================
-# Bot初期設定
-# ============================================================
-
-intents = discord.Intents.default()
-# message_content は今のところスラッシュコマンドには不要だが、
-# 将来 on_message や prefix コマンドを併用する可能性を考えて有効化しておく
-# (Discord Developer Portal の Bot タブで MESSAGE CONTENT INTENT を ON にしておくこと)
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# 開発中のサーバー(ギルド)ID。環境変数 GUILD_ID に設定すると、
-# そのサーバーだけスラッシュコマンドが即座に反映される。
-# 未設定の場合はグローバル同期になり、全サーバーへの反映に最大1時間かかることがある。
-# サーバーIDの調べ方: Discordの「設定→詳細設定→開発者モード」をON にしてから、
-# サーバーアイコンを右クリック→「IDをコピー」
-GUILD_ID = os.getenv("GUILD_ID")
-GUILD_OBJECT = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
+matplotlib.use("Agg")  # サーバー上に画面がなくても描画できるようにする設定
+import japanize_matplotlib  # noqa: F401  (import するだけでグラフの日本語文字化けを防げる)
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy import stats as scipy_stats
 
 
-# ============================================================
-# 起動時イベント:スラッシュコマンドの同期
-# ============================================================
-
-@bot.event
-async def on_ready():
-    print(f"✅ ログインしました: {bot.user}")
-
-    try:
-        if GUILD_OBJECT is not None:
-            # 開発用サーバーに限定して即時反映(開発中はこちらが便利)
-            bot.tree.copy_global_to(guild=GUILD_OBJECT)
-            synced = await bot.tree.sync(guild=GUILD_OBJECT)
-            print(f"🔄 スラッシュコマンドを{len(synced)}件、開発用サーバーに同期しました")
-        else:
-            # 全サーバー向けのグローバル同期
-            synced = await bot.tree.sync()
-            print(f"🔄 スラッシュコマンドを{len(synced)}件、グローバルに同期しました")
-    except Exception as e:
-        print(f"⚠️ コマンド同期でエラーが発生しました: {e}")
+class DataParseError(ValueError):
+    """数値データの解析に失敗したときの例外"""
 
 
-# ============================================================
-# スラッシュコマンド
-# ここに /boxplot や /hist などを今後追加していく
-# ============================================================
+async def parse_number_input(
+    data: Optional[str],
+    file: Optional[discord.Attachment],
+    min_count: int = 1,
+) -> List[float]:
+    """
+    スラッシュコマンドの `data`(文字列)または `file`(添付ファイル)から
+    数値のリストを取り出す。両方指定された場合は file を優先する。
+    区切り文字はカンマ・空白・改行のどれでも良い。
 
-@bot.tree.command(name="ping", description="Botの生存確認をします")
-async def ping(interaction: discord.Interaction):
-    """動作確認用の最小コマンド"""
-    await interaction.response.send_message("pong!")
-
-
-@bot.tree.command(name="boxplot", description="数値データから箱ひげ図を作成します")
-@app_commands.describe(
-    data="カンマ・空白・改行区切りの数値 (例: 1,2,3,4,5)",
-    file="数値が書かれたテキスト/CSVファイル(dataの代わりに指定可)",
-)
-async def boxplot(
-    interaction: discord.Interaction,
-    data: Optional[str] = None,
-    file: Optional[discord.Attachment] = None,
-):
-    await interaction.response.defer()  # 画像生成に時間がかかる場合があるため
-
-    try:
-        values = await parse_number_input(data, file, min_count=2)
-    except DataParseError as e:
-        await interaction.followup.send(f"⚠️ {e}")
-        return
-
-    image_buf = create_boxplot_image(values)
-    stats = compute_basic_stats(values)
-
-    embed = discord.Embed(title="📦 箱ひげ図", color=discord.Color.blue())
-    embed.add_field(name="個数", value=str(stats["個数"]))
-    embed.add_field(name="平均", value=f'{stats["平均"]:.2f}')
-    embed.add_field(name="中央値", value=f'{stats["中央値"]:.2f}')
-    embed.add_field(name="標準偏差", value=f'{stats["標準偏差"]:.2f}')
-    embed.add_field(name="最小値〜最大値", value=f'{stats["最小値"]:.2f} 〜 {stats["最大値"]:.2f}')
-    embed.add_field(name="第1〜第3四分位数", value=f'{stats["第1四分位数"]:.2f} 〜 {stats["第3四分位数"]:.2f}')
-    embed.set_image(url="attachment://boxplot.png")
-    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
-
-    await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="boxplot.png"))
-
-
-@bot.tree.command(name="hist", description="数値データからヒストグラムを作成します")
-@app_commands.describe(
-    data="カンマ・空白・改行区切りの数値 (例: 1,2,3,4,5)",
-    file="数値が書かれたテキスト/CSVファイル(dataの代わりに指定可)",
-    bins="ビン(区間)の数。省略時は10",
-)
-async def hist(
-    interaction: discord.Interaction,
-    data: Optional[str] = None,
-    file: Optional[discord.Attachment] = None,
-    bins: Optional[int] = 10,
-):
-    await interaction.response.defer()
-
-    try:
-        values = await parse_number_input(data, file, min_count=2)
-    except DataParseError as e:
-        await interaction.followup.send(f"⚠️ {e}")
-        return
-
-    image_buf = create_histogram_image(values, bins=bins or 10)
-
-    embed = discord.Embed(title="📊 ヒストグラム", color=discord.Color.green())
-    embed.set_image(url="attachment://hist.png")
-    embed.set_footer(text=f"実行者: {interaction.user.display_name} ｜ 個数: {len(values)}")
-
-    await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="hist.png"))
-
-
-# ============================================================
-# エラー処理(スラッシュコマンド用)
-# ============================================================
-
-@bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
-):
-    if isinstance(error, app_commands.MissingPermissions):
-        message = "⚠️ このコマンドを実行する権限がありません。"
-    elif isinstance(error, app_commands.CommandOnCooldown):
-        message = f"⚠️ クールダウン中です。{error.retry_after:.1f}秒後に再試行してください。"
+    min_count: 最低限必要な個数。足りない場合は DataParseError を送出する。
+    """
+    if file is not None:
+        raw_bytes = await file.read()
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise DataParseError(
+                "ファイルの文字コードがUTF-8ではないようです。UTF-8で保存し直してください。"
+            )
+    elif data is not None:
+        text = data
     else:
-        message = f"⚠️ エラーが発生しました: {error}"
-        print(f"[app_command_error] {error!r}")
+        raise DataParseError(
+            "`data`(数値の並び)か`file`(数値が書かれたファイル)のどちらかを指定してください。"
+        )
 
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
+    tokens = [t for t in text.replace(",", " ").replace("\n", " ").split(" ") if t.strip()]
+
+    if not tokens:
+        raise DataParseError("数値が見つかりませんでした。")
+
+    values: List[float] = []
+    invalid_tokens: List[str] = []
+    for t in tokens:
+        try:
+            values.append(float(t))
+        except ValueError:
+            invalid_tokens.append(t)
+
+    if invalid_tokens:
+        preview = ", ".join(invalid_tokens[:5])
+        suffix = " など" if len(invalid_tokens) > 5 else ""
+        raise DataParseError(f"数値として読み取れない値がありました: {preview}{suffix}")
+
+    if len(values) < min_count:
+        raise DataParseError(
+            f"{min_count}個以上の数値が必要です(入力されたのは{len(values)}個)。"
+        )
+
+    return values
 
 
-# ============================================================
-# 起動
-# ============================================================
+def create_boxplot_image(values: List[float], label: str = "データ") -> io.BytesIO:
+    """箱ひげ図を作成し、PNG画像としてBytesIOに書き出す"""
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.boxplot(values, tick_labels=[label], showmeans=True, showfliers=True)
+    ax.set_title("箱ひげ図")
+    ax.set_ylabel("値")
 
-keep_alive()  # Flaskサーバを別スレッドで起動(Renderを起こし続けるため)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
-TOKEN = os.getenv("DISCORD_TOKEN")
 
-if not TOKEN:
-    raise RuntimeError("環境変数 DISCORD_TOKEN が設定されていません。")
+def create_histogram_image(values: List[float], bins: int = 10) -> io.BytesIO:
+    """ヒストグラムを作成し、PNG画像としてBytesIOに書き出す"""
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.hist(values, bins=bins, edgecolor="black", alpha=0.7)
+    ax.set_title("ヒストグラム")
+    ax.set_xlabel("値")
+    ax.set_ylabel("度数")
 
-bot.run(TOKEN)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def compute_basic_stats(values: List[float]) -> dict:
+    """第11回で扱った基本統計量を計算する"""
+    arr = np.array(values)
+    mode_result = scipy_stats.mode(arr, keepdims=True)
+
+    return {
+        "個数": len(arr),
+        "平均": float(np.mean(arr)),
+        "中央値": float(np.median(arr)),
+        "最頻値": float(mode_result.mode[0]),
+        "標準偏差": float(np.std(arr)),
+        "最小値": float(np.min(arr)),
+        "最大値": float(np.max(arr)),
+        "第1四分位数": float(np.percentile(arr, 25)),
+        "第3四分位数": float(np.percentile(arr, 75)),
+    }
+
+
+def create_stats_image(values: List[float]) -> io.BytesIO:
+    """
+    データ全体をドットプロットとして可視化する。
+    数直線上に各データ点を並べ、平均(赤の破線)と中央値(青の点線)を重ねて表示する。
+    /boxplot(箱ひげ図)とは違う切り口で、個々のデータ点の分布そのものを見せる。
+    """
+    arr = np.array(values)
+    mean = float(np.mean(arr))
+    median = float(np.median(arr))
+
+    fig, ax = plt.subplots(figsize=(7, 2.8))
+    # 点が重なって見えなくなるのを防ぐため、縦方向にわずかにジッター(ランダムなずらし)を加える
+    rng = np.random.default_rng(0)
+    jitter = rng.uniform(-0.05, 0.05, size=len(arr))
+
+    ax.scatter(arr, jitter, alpha=0.7, s=60, zorder=3, label="データ")
+    ax.axvline(mean, color="red", linestyle="--", linewidth=1.5, label=f"平均 = {mean:.2f}")
+    ax.axvline(median, color="blue", linestyle=":", linewidth=1.5, label=f"中央値 = {median:.2f}")
+
+    ax.set_yticks([])
+    ax.set_ylim(-0.3, 0.3)
+    ax.set_xlabel("値")
+    ax.set_title("データの分布(ドットプロット)")
+    ax.legend(loc="upper right", fontsize=8)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
