@@ -10,11 +10,19 @@
 """
 
 import os
+from typing import Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from charts import (
+    DataParseError,
+    compute_basic_stats,
+    create_boxplot_image,
+    create_histogram_image,
+    parse_number_input,
+)
 from keep_alive import keep_alive
 
 # ============================================================
@@ -69,6 +77,77 @@ async def on_ready():
 async def ping(interaction: discord.Interaction):
     """動作確認用の最小コマンド"""
     await interaction.response.send_message("pong!")
+
+
+@bot.tree.command(name="boxplot", description="数値データから箱ひげ図を作成します")
+@app_commands.describe(
+    data="カンマ・空白・改行区切りの数値 (例: 1,2,3,4,5)",
+    file="数値が書かれたテキスト/CSVファイル(dataの代わりに指定可)",
+)
+async def boxplot(
+    interaction: discord.Interaction,
+    data: Optional[str] = None,
+    file: Optional[discord.Attachment] = None,
+):
+    await interaction.response.defer()  # 画像生成に時間がかかる場合があるため
+
+    try:
+        values = await parse_number_input(data, file)
+    except DataParseError as e:
+        await interaction.followup.send(f"⚠️ {e}")
+        return
+
+    if len(values) < 2:
+        await interaction.followup.send("⚠️ 箱ひげ図の作成には2個以上の数値が必要です。")
+        return
+
+    image_buf = create_boxplot_image(values)
+    stats = compute_basic_stats(values)
+
+    embed = discord.Embed(title="📦 箱ひげ図", color=discord.Color.blue())
+    embed.add_field(name="個数", value=str(stats["個数"]))
+    embed.add_field(name="平均", value=f'{stats["平均"]:.2f}')
+    embed.add_field(name="中央値", value=f'{stats["中央値"]:.2f}')
+    embed.add_field(name="標準偏差", value=f'{stats["標準偏差"]:.2f}')
+    embed.add_field(name="最小値〜最大値", value=f'{stats["最小値"]:.2f} 〜 {stats["最大値"]:.2f}')
+    embed.add_field(name="第1〜第3四分位数", value=f'{stats["第1四分位数"]:.2f} 〜 {stats["第3四分位数"]:.2f}')
+    embed.set_image(url="attachment://boxplot.png")
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+
+    await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="boxplot.png"))
+
+
+@bot.tree.command(name="hist", description="数値データからヒストグラムを作成します")
+@app_commands.describe(
+    data="カンマ・空白・改行区切りの数値 (例: 1,2,3,4,5)",
+    file="数値が書かれたテキスト/CSVファイル(dataの代わりに指定可)",
+    bins="ビン(区間)の数。省略時は10",
+)
+async def hist(
+    interaction: discord.Interaction,
+    data: Optional[str] = None,
+    file: Optional[discord.Attachment] = None,
+    bins: Optional[int] = 10,
+):
+    await interaction.response.defer()
+
+    try:
+        values = await parse_number_input(data, file)
+    except DataParseError as e:
+        await interaction.followup.send(f"⚠️ {e}")
+        return
+
+    if len(values) < 2:
+        await interaction.followup.send("⚠️ ヒストグラムの作成には2個以上の数値が必要です。")
+        return
+
+    image_buf = create_histogram_image(values, bins=bins or 10)
+
+    embed = discord.Embed(title="📊 ヒストグラム", color=discord.Color.green())
+    embed.set_image(url="attachment://hist.png")
+    embed.set_footer(text=f"実行者: {interaction.user.display_name} ｜ 個数: {len(values)}")
+
+    await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="hist.png"))
 
 
 # ============================================================
