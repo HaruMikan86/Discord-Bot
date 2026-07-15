@@ -124,27 +124,48 @@ def compute_basic_stats(values: List[float]) -> dict:
 
 def create_stats_image(values: List[float]) -> io.BytesIO:
     """
-    データ全体をドットプロットとして可視化する。
-    数直線上に各データ点を並べ、平均(赤の破線)と中央値(青の点線)を重ねて表示する。
+    データ全体を可視化する。平均(赤の破線)と中央値(青の点線)を重ねて表示する。
     /boxplot(箱ひげ図)とは違う切り口で、個々のデータ点の分布そのものを見せる。
+
+    データ数によって描画方式を自動的に切り替える:
+      - 80個以下: ジッター付きドットプロット(1点ずつ確認したい少数データ向け)
+      - 81個以上: バイオリンプロット+ラグプロット(点が重なって潰れるのを防ぐ)
     """
     arr = np.array(values)
+    n = len(arr)
     mean = float(np.mean(arr))
     median = float(np.median(arr))
 
-    fig, ax = plt.subplots(figsize=(7, 2.8))
-    # 点が重なって見えなくなるのを防ぐため、縦方向にわずかにジッター(ランダムなずらし)を加える
-    rng = np.random.default_rng(0)
-    jitter = rng.uniform(-0.05, 0.05, size=len(arr))
+    fig, ax = plt.subplots(figsize=(7, 3.2))
 
-    ax.scatter(arr, jitter, alpha=0.7, s=60, zorder=3, label="データ")
+    if n <= 80:
+        # データ数が多いほど、点を小さく・薄く・広く散らして重なりを緩和する
+        if n <= 20:
+            marker_size, alpha, jitter_range = 90, 0.8, 0.06
+        else:
+            marker_size, alpha, jitter_range = 55, 0.6, 0.12
+
+        rng = np.random.default_rng(0)
+        jitter = rng.uniform(-jitter_range, jitter_range, size=n)
+        ax.scatter(arr, jitter, alpha=alpha, s=marker_size, zorder=3, label="データ", edgecolors="none")
+        ax.set_ylim(-0.35, 0.35)
+        title_suffix = "ドットプロット"
+    else:
+        # 点が多すぎて潰れる場合は、分布の形(バイオリンプロット)+
+        # 実データの位置(ラグプロット、下部の短い縦線)の組み合わせに切り替える
+        parts = ax.violinplot(arr, vert=False, positions=[0], widths=0.6, showextrema=False)
+        for pc in parts["bodies"]:
+            pc.set_alpha(0.4)
+        ax.plot(arr, np.full(n, -0.32), "|", color="tab:blue", alpha=0.5, markersize=10, zorder=3, label="データ")
+        ax.set_ylim(-0.4, 0.4)
+        title_suffix = "分布(バイオリン+ラグプロット)"
+
     ax.axvline(mean, color="red", linestyle="--", linewidth=1.5, label=f"平均 = {mean:.2f}")
     ax.axvline(median, color="blue", linestyle=":", linewidth=1.5, label=f"中央値 = {median:.2f}")
 
     ax.set_yticks([])
-    ax.set_ylim(-0.3, 0.3)
     ax.set_xlabel("値")
-    ax.set_title("データの分布(ドットプロット)")
+    ax.set_title(f"データの{title_suffix}(n={n})")
     ax.legend(loc="upper right", fontsize=8)
 
     buf = io.BytesIO()
