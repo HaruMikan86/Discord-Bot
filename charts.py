@@ -25,11 +25,14 @@ class DataParseError(ValueError):
 async def parse_number_input(
     data: Optional[str],
     file: Optional[discord.Attachment],
+    min_count: int = 1,
 ) -> List[float]:
     """
     スラッシュコマンドの `data`(文字列)または `file`(添付ファイル)から
     数値のリストを取り出す。両方指定された場合は file を優先する。
     区切り文字はカンマ・空白・改行のどれでも良い。
+
+    min_count: 最低限必要な個数。足りない場合は DataParseError を送出する。
     """
     if file is not None:
         raw_bytes = await file.read()
@@ -63,6 +66,11 @@ async def parse_number_input(
         preview = ", ".join(invalid_tokens[:5])
         suffix = " など" if len(invalid_tokens) > 5 else ""
         raise DataParseError(f"数値として読み取れない値がありました: {preview}{suffix}")
+
+    if len(values) < min_count:
+        raise DataParseError(
+            f"{min_count}個以上の数値が必要です(入力されたのは{len(values)}個)。"
+        )
 
     return values
 
