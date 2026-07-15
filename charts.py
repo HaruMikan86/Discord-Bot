@@ -120,3 +120,35 @@ def compute_basic_stats(values: List[float]) -> dict:
         "第1四分位数": float(np.percentile(arr, 25)),
         "第3四分位数": float(np.percentile(arr, 75)),
     }
+
+
+def create_stats_image(values: List[float]) -> io.BytesIO:
+    """
+    データ全体をドットプロットとして可視化する。
+    数直線上に各データ点を並べ、平均(赤の破線)と中央値(青の点線)を重ねて表示する。
+    /boxplot(箱ひげ図)とは違う切り口で、個々のデータ点の分布そのものを見せる。
+    """
+    arr = np.array(values)
+    mean = float(np.mean(arr))
+    median = float(np.median(arr))
+
+    fig, ax = plt.subplots(figsize=(7, 2.8))
+    # 点が重なって見えなくなるのを防ぐため、縦方向にわずかにジッター(ランダムなずらし)を加える
+    rng = np.random.default_rng(0)
+    jitter = rng.uniform(-0.05, 0.05, size=len(arr))
+
+    ax.scatter(arr, jitter, alpha=0.7, s=60, zorder=3, label="データ")
+    ax.axvline(mean, color="red", linestyle="--", linewidth=1.5, label=f"平均 = {mean:.2f}")
+    ax.axvline(median, color="blue", linestyle=":", linewidth=1.5, label=f"中央値 = {median:.2f}")
+
+    ax.set_yticks([])
+    ax.set_ylim(-0.3, 0.3)
+    ax.set_xlabel("値")
+    ax.set_title("データの分布(ドットプロット)")
+    ax.legend(loc="upper right", fontsize=8)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
