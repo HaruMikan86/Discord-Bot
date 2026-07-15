@@ -92,13 +92,9 @@ async def boxplot(
     await interaction.response.defer()  # 画像生成に時間がかかる場合があるため
 
     try:
-        values = await parse_number_input(data, file)
+        values = await parse_number_input(data, file, min_count=2)
     except DataParseError as e:
         await interaction.followup.send(f"⚠️ {e}")
-        return
-
-    if len(values) < 2:
-        await interaction.followup.send("⚠️ 箱ひげ図の作成には2個以上の数値が必要です。")
         return
 
     image_buf = create_boxplot_image(values)
@@ -132,13 +128,9 @@ async def hist(
     await interaction.response.defer()
 
     try:
-        values = await parse_number_input(data, file)
+        values = await parse_number_input(data, file, min_count=2)
     except DataParseError as e:
         await interaction.followup.send(f"⚠️ {e}")
-        return
-
-    if len(values) < 2:
-        await interaction.followup.send("⚠️ ヒストグラムの作成には2個以上の数値が必要です。")
         return
 
     image_buf = create_histogram_image(values, bins=bins or 10)
