@@ -6,7 +6,7 @@
 """
 
 import io
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import discord
 import matplotlib
@@ -167,6 +167,134 @@ def create_stats_image(values: List[float]) -> io.BytesIO:
     ax.set_xlabel("値")
     ax.set_title(f"データの{title_suffix}(n={n})")
     ax.legend(loc="upper right", fontsize=8)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ============================================================
+# /corr 用: 2系列データの相関分析
+# ============================================================
+
+async def parse_paired_number_input(
+    x_data: Optional[str],
+    y_data: Optional[str],
+    file: Optional[discord.Attachment],
+) -> Tuple[List[float], List[float]]:
+    """
+    /corr 用に、x・y 2系列の数値を取得する。
+
+    - file が指定された場合: 1行に「x,y」の形式で書かれたテキスト/CSVとして読み込む
+    - x_data と y_data が指定された場合: それぞれ独立したカンマ区切り等の数値列として読み込む
+    """
+    if file is not None:
+        raw_bytes = await file.read()
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise DataParseError(
+                "ファイルの文字コードがUTF-8ではないようです。UTF-8で保存し直してください。"
+            )
+
+        x_values: List[float] = []
+        y_values: List[float] = []
+        invalid_lines: List[str] = []
+
+        for line_no, raw_line in enumerate(text.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.replace("\t", ",").split(",") if p.strip()]
+            if len(parts) != 2:
+                invalid_lines.append(f"{line_no}行目「{line}」")
+                continue
+            try:
+                x_values.append(float(parts[0]))
+                y_values.append(float(parts[1]))
+            except ValueError:
+                invalid_lines.append(f"{line_no}行目「{line}」")
+
+        if invalid_lines:
+            preview = " / ".join(invalid_lines[:5])
+            raise DataParseError(f"「x,y」の形式で読み取れない行がありました: {preview}")
+
+        if not x_values:
+            raise DataParseError("ファイルから数値のペアが見つかりませんでした。")
+
+    elif x_data is not None and y_data is not None:
+        x_values = await parse_number_input(x_data, None)
+        y_values = await parse_number_input(y_data, None)
+    else:
+        raise DataParseError(
+            "`x`と`y`の両方(カンマ区切りの数値)か、`file`(「x,y」形式のファイル)のどちらかを指定してください。"
+        )
+
+    if len(x_values) != len(y_values):
+        raise DataParseError(
+            f"xとyの個数が一致していません(x: {len(x_values)}個, y: {len(y_values)}個)。"
+        )
+
+    if len(x_values) < 2:
+        raise DataParseError("相関係数の計算には2組以上のデータが必要です。")
+
+    return x_values, y_values
+
+
+def _correlation_label(r: float) -> str:
+    """第11回の相関係数の強弱表(-1〜1の7段階)に基づいて判定する"""
+    if r >= 0.7:
+        return "強い正の相関"
+    elif r >= 0.4:
+        return "正の相関"
+    elif r >= 0.2:
+        return "弱い正の相関"
+    elif r >= -0.2:
+        return "ほとんど相関がない"
+    elif r >= -0.4:
+        return "弱い負の相関"
+    elif r >= -0.7:
+        return "負の相関"
+    else:
+        return "強い負の相関"
+
+
+def compute_correlation(x_values: List[float], y_values: List[float]) -> dict:
+    """相関係数と、その強弱の判定(第11回の表に基づく)を計算する"""
+    x_arr = np.array(x_values)
+    y_arr = np.array(y_values)
+
+    if np.std(x_arr) == 0 or np.std(y_arr) == 0:
+        raise DataParseError("xまたはyの値がすべて同じため、相関係数を計算できません。")
+
+    r = float(np.corrcoef(x_arr, y_arr)[0, 1])
+
+    return {
+        "n": len(x_values),
+        "r": r,
+        "label": _correlation_label(r),
+    }
+
+
+def create_scatter_image(x_values: List[float], y_values: List[float], r: float) -> io.BytesIO:
+    """散布図を作成する。データ点が2個以上あれば、最小二乗法による回帰直線も重ねて描く"""
+    x_arr = np.array(x_values)
+    y_arr = np.array(y_values)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(x_arr, y_arr, alpha=0.7, s=60, zorder=3, label="データ")
+
+    slope, intercept = np.polyfit(x_arr, y_arr, 1)
+    x_line = np.linspace(x_arr.min(), x_arr.max(), 100)
+    y_line = slope * x_line + intercept
+    ax.plot(x_line, y_line, color="red", linestyle="--", linewidth=1.5, label="回帰直線")
+
+    ax.set_title(f"散布図(相関係数 r = {r:.3f})")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.legend(loc="best", fontsize=8)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
