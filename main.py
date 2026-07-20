@@ -19,10 +19,13 @@ from discord.ext import commands
 from charts import (
     DataParseError,
     compute_basic_stats,
+    compute_correlation,
     create_boxplot_image,
     create_histogram_image,
+    create_scatter_image,
     create_stats_image,
     parse_number_input,
+    parse_paired_number_input,
 )
 from keep_alive import keep_alive
 
@@ -183,6 +186,39 @@ async def hist(
     embed.set_footer(text=f"実行者: {interaction.user.display_name} ｜ 個数: {len(values)}")
 
     await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="hist.png"))
+
+
+@bot.tree.command(name="corr", description="2つの数値データの相関係数を計算し、散布図を作成します")
+@app_commands.describe(
+    x="xの値(カンマ・空白・改行区切りの数値)",
+    y="yの値(xと同じ個数で指定)",
+    file="「x,y」の形式で1行に1組ずつ書かれたファイル(x・yの代わりに指定可)",
+)
+async def corr(
+    interaction: discord.Interaction,
+    x: Optional[str] = None,
+    y: Optional[str] = None,
+    file: Optional[discord.Attachment] = None,
+):
+    await interaction.response.defer()
+
+    try:
+        x_values, y_values = await parse_paired_number_input(x, y, file)
+        result = compute_correlation(x_values, y_values)
+    except DataParseError as e:
+        await interaction.followup.send(f"⚠️ {e}")
+        return
+
+    image_buf = create_scatter_image(x_values, y_values, result["r"])
+
+    embed = discord.Embed(title="📉 相関分析", color=discord.Color.purple())
+    embed.add_field(name="データ数", value=str(result["n"]))
+    embed.add_field(name="相関係数 r", value=f'{result["r"]:.3f}')
+    embed.add_field(name="判定", value=result["label"])
+    embed.set_image(url="attachment://scatter.png")
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+
+    await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="scatter.png"))
 
 
 # ============================================================
