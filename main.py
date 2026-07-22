@@ -21,9 +21,11 @@ from charts import (
     compute_basic_stats,
     compute_correlation,
     create_boxplot_image,
+    create_function_plot_image,
     create_histogram_image,
     create_scatter_image,
     create_stats_image,
+    parse_function_expression,
     parse_number_input,
     parse_paired_number_input,
 )
@@ -219,6 +221,38 @@ async def corr(
     embed.set_footer(text=f"実行者: {interaction.user.display_name}")
 
     await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="scatter.png"))
+
+
+@bot.tree.command(name="plot", description="xの関数の式からグラフを作成します(例: x**2-3*x+2)")
+@app_commands.describe(
+    expr="xの関数の式 (例: x**2-3*x+2, sin(x), exp(x), sqrt(x), 1/x)",
+    x_min="xの表示範囲の最小値(省略時: -10)",
+    x_max="xの表示範囲の最大値(省略時: 10)",
+)
+async def plot(
+    interaction: discord.Interaction,
+    expr: str,
+    x_min: float = -10.0,
+    x_max: float = 10.0,
+):
+    await interaction.response.defer()
+
+    try:
+        parsed_expr = parse_function_expression(expr)
+        image_buf = create_function_plot_image(parsed_expr, x_min=x_min, x_max=x_max)
+    except DataParseError as e:
+        await interaction.followup.send(f"⚠️ {e}")
+        return
+
+    embed = discord.Embed(
+        title="📐 関数のグラフ",
+        description=f"y = {parsed_expr}",
+        color=discord.Color.teal(),
+    )
+    embed.set_image(url="attachment://plot.png")
+    embed.set_footer(text=f"実行者: {interaction.user.display_name} ｜ 範囲: [{x_min}, {x_max}]")
+
+    await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="plot.png"))
 
 
 # ============================================================
