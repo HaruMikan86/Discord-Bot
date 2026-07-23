@@ -445,3 +445,178 @@ def create_function_plot_image(
     plt.close(fig)
     buf.seek(0)
     return buf
+
+
+# ============================================================
+# /encode 用: Unicodeコードポイント → UTF-8バイト列
+# ============================================================
+
+def encode_unicode_string(code_str: str) -> str:
+    """
+    'U+03A9' のような形式のUnicodeコードポイント文字列を、
+    UTF-8のバイト列(16進2桁・大文字を空白区切り)に変換する。
+    """
+    if not code_str or not code_str.strip():
+        raise DataParseError("コードポイントを指定してください(例: `U+03A9`)。")
+
+    text = code_str.strip()
+    hex_part = text.split("+", 1)[1] if "+" in text else text
+
+    try:
+        code = int(hex_part, 16)
+    except ValueError:
+        raise DataParseError(f"16進数として読み取れませんでした: {hex_part}")
+
+    if not (0 <= code <= 0x10FFFF):
+        raise DataParseError("コードポイントの範囲は U+0000〜U+10FFFF です。")
+
+    if 0xD800 <= code <= 0xDFFF:
+        raise DataParseError("サロゲート領域(U+D800〜U+DFFF)は単独の文字として存在できません。")
+
+    utf8_bytes = chr(code).encode("utf-8")
+    return " ".join(format(b, "02X") for b in utf8_bytes)
+
+
+# ============================================================
+# /binom, /normal 用: 確率分布の可視化
+# ============================================================
+
+def create_binomial_plot_image(n: int, p: float) -> io.BytesIO:
+    """二項分布 B(n, p) の確率質量関数を棒グラフで可視化する(第11回)"""
+    if not (1 <= n <= 500):
+        raise DataParseError("nは1〜500の範囲で指定してください。")
+    if not (0.0 <= p <= 1.0):
+        raise DataParseError("pは0〜1の範囲で指定してください。")
+
+    k = np.arange(0, n + 1)
+    pmf = scipy_stats.binom.pmf(k, n, p)
+    mean = n * p
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.bar(k, pmf, color="tab:blue", alpha=0.75, width=0.9)
+    ax.axvline(mean, color="red", linestyle="--", linewidth=1.5, label=f"平均 = {mean:.2f}")
+    ax.set_title(f"二項分布 B(n={n}, p={p})")
+    ax.set_xlabel("成功回数 k")
+    ax.set_ylabel("確率")
+    ax.legend()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def create_normal_plot_image(mean: float, std: float) -> io.BytesIO:
+    """正規分布 N(mean, std^2) の確率密度関数を可視化する(第11回)"""
+    if std <= 0:
+        raise DataParseError("標準偏差は正の値で指定してください。")
+
+    x = np.linspace(mean - 4 * std, mean + 4 * std, 500)
+    y = scipy_stats.norm.pdf(x, mean, std)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(x, y, color="tab:blue", linewidth=2)
+    ax.fill_between(x, y, alpha=0.2)
+    ax.axvline(mean, color="red", linestyle="--", linewidth=1.5, label=f"平均 = {mean:.2f}")
+    ax.set_title(f"正規分布 N({mean}, {std}²)")
+    ax.set_xlabel("値")
+    ax.set_ylabel("確率密度")
+    ax.legend()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+# ============================================================
+# /solve 用: 方程式を解く(/plot の安全なパース処理を再利用)
+# ============================================================
+
+def parse_and_solve_equation(equation_str: str) -> List[sympy.Expr]:
+    """
+    'x**2 - 4 = 0' や 'x**2 = 4' のような方程式の文字列を解析し、
+    SymPyで解いた結果(解のリスト)を返す。/plot と同じ安全性チェックを使う。
+    """
+    if not equation_str or not equation_str.strip():
+        raise DataParseError("方程式を指定してください(例: `x**2 - 4 = 0` や `x**2 = 4`)。")
+
+    if len(equation_str) > _MAX_EXPR_LENGTH:
+        raise DataParseError(f"式が長すぎます({_MAX_EXPR_LENGTH}文字以内にしてください)。")
+
+    if equation_str.count("=") > 1:
+        raise DataParseError("「=」は1つまでにしてください。")
+
+    if "=" in equation_str:
+        lhs_str, rhs_str = equation_str.split("=", 1)
+    else:
+        lhs_str, rhs_str = equation_str, "0"
+
+    _validate_identifiers(lhs_str)
+    _validate_identifiers(rhs_str)
+
+    try:
+        lhs = parse_expr(lhs_str, local_dict=_LOCAL_DICT, global_dict=None,
+                          transformations=_TRANSFORMATIONS, evaluate=True)
+        rhs = parse_expr(rhs_str, local_dict=_LOCAL_DICT, global_dict=None,
+                          transformations=_TRANSFORMATIONS, evaluate=True)
+    except Exception:
+        raise DataParseError("式を解析できませんでした。書き方を確認してください(例: `x**2 - 4 = 0`)。")
+
+    combined_free_symbols = lhs.free_symbols | rhs.free_symbols
+    disallowed_symbols = combined_free_symbols - {sympy.Symbol("x")}
+    if disallowed_symbols:
+        names = ", ".join(str(s) for s in disallowed_symbols)
+        raise DataParseError(f"`x`以外の変数は使えません: {names}")
+
+    equation = sympy.Eq(lhs, rhs)
+
+    try:
+        solutions = sympy.solve(equation, sympy.Symbol("x"))
+    except Exception:
+        raise DataParseError("方程式を解けませんでした。式の書き方を見直してください。")
+
+    if not solutions:
+        raise DataParseError("解が見つかりませんでした。")
+
+    return solutions
+
+
+def create_solution_plot_image(solutions: List[sympy.Expr]) -> Optional[io.BytesIO]:
+    """
+    方程式の実数解を数直線上にプロットする。
+    複素数解が含まれる、または評価できない解がある場合は None を返す
+    (数直線での表現が適さないため、呼び出し側でテキストのみの表示に切り替える)。
+    """
+    real_solutions: List[float] = []
+    for sol in solutions:
+        try:
+            val = complex(sol)
+        except (TypeError, ValueError):
+            return None
+        if abs(val.imag) > 1e-9:
+            return None
+        real_solutions.append(val.real)
+
+    if not real_solutions:
+        return None
+
+    fig, ax = plt.subplots(figsize=(7, 2.2))
+    ax.axhline(0, color="black", linewidth=1)
+    ax.scatter(real_solutions, [0] * len(real_solutions), color="red", s=100, zorder=3)
+    for val in real_solutions:
+        ax.annotate(f"{val:.3g}", (val, 0), textcoords="offset points", xytext=(0, 14), ha="center")
+
+    margin = max(max((abs(v) for v in real_solutions), default=1), 1) * 1.5
+    ax.set_xlim(-margin, margin)
+    ax.set_yticks([])
+    ax.set_title("方程式の解(数直線上)")
+    ax.set_xlabel("x")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
