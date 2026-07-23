@@ -20,11 +20,16 @@ from charts import (
     DataParseError,
     compute_basic_stats,
     compute_correlation,
+    create_binomial_plot_image,
     create_boxplot_image,
     create_function_plot_image,
     create_histogram_image,
+    create_normal_plot_image,
     create_scatter_image,
+    create_solution_plot_image,
     create_stats_image,
+    encode_unicode_string,
+    parse_and_solve_equation,
     parse_function_expression,
     parse_number_input,
     parse_paired_number_input,
@@ -78,12 +83,6 @@ async def on_ready():
 # スラッシュコマンド
 # ここに /boxplot や /hist などを今後追加していく
 # ============================================================
-
-@bot.tree.command(name="ping", description="Botの生存確認をします")
-async def ping(interaction: discord.Interaction):
-    """動作確認用の最小コマンド"""
-    await interaction.response.send_message("pong!")
-
 
 @bot.tree.command(name="stats", description="数値データの基本統計量を計算し、ドットプロットで可視化します")
 @app_commands.describe(
@@ -253,6 +252,100 @@ async def plot(
     embed.set_footer(text=f"実行者: {interaction.user.display_name} ｜ 範囲: [{x_min}, {x_max}]")
 
     await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="plot.png"))
+
+
+@bot.tree.command(name="encode", description="UnicodeコードポイントをUTF-8のバイト列に変換します")
+@app_commands.describe(code="コードポイント (例: U+03A9)")
+async def encode(interaction: discord.Interaction, code: str):
+    try:
+        result = encode_unicode_string(code)
+    except DataParseError as e:
+        await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="🔤 UTF-8エンコード", color=discord.Color.dark_teal())
+    embed.add_field(name="入力", value=code, inline=True)
+    embed.add_field(name="UTF-8バイト列(16進)", value=f"`{result}`", inline=True)
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="binom", description="二項分布 B(n, p) をグラフで可視化します")
+@app_commands.describe(
+    n="試行回数(1〜500)",
+    p="成功確率(0〜1)",
+)
+async def binom(interaction: discord.Interaction, n: int, p: float):
+    await interaction.response.defer()
+
+    try:
+        image_buf = create_binomial_plot_image(n, p)
+    except DataParseError as e:
+        await interaction.followup.send(f"⚠️ {e}")
+        return
+
+    mean = n * p
+    variance = n * p * (1 - p)
+
+    embed = discord.Embed(title="🎲 二項分布", description=f"B(n={n}, p={p})", color=discord.Color.gold())
+    embed.add_field(name="平均(np)", value=f"{mean:.3f}")
+    embed.add_field(name="分散(np(1-p))", value=f"{variance:.3f}")
+    embed.set_image(url="attachment://binom.png")
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+
+    await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="binom.png"))
+
+
+@bot.tree.command(name="normal", description="正規分布 N(平均, 標準偏差²) をグラフで可視化します")
+@app_commands.describe(
+    mean="平均",
+    std="標準偏差(正の値)",
+)
+async def normal(interaction: discord.Interaction, mean: float, std: float):
+    await interaction.response.defer()
+
+    try:
+        image_buf = create_normal_plot_image(mean, std)
+    except DataParseError as e:
+        await interaction.followup.send(f"⚠️ {e}")
+        return
+
+    embed = discord.Embed(
+        title="🔔 正規分布",
+        description=f"N({mean}, {std}²)",
+        color=discord.Color.blurple(),
+    )
+    embed.set_image(url="attachment://normal.png")
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+
+    await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="normal.png"))
+
+
+@bot.tree.command(name="solve", description="xの方程式を解きます(例: x**2-4=0)")
+@app_commands.describe(equation="xの方程式 (例: x**2-4=0, 2*x+3=0, sin(x)=0)")
+async def solve(interaction: discord.Interaction, equation: str):
+    await interaction.response.defer()
+
+    try:
+        solutions = parse_and_solve_equation(equation)
+    except DataParseError as e:
+        await interaction.followup.send(f"⚠️ {e}")
+        return
+
+    solutions_text = ", ".join(str(s) for s in solutions)
+    embed = discord.Embed(title="🧮 方程式の解", color=discord.Color.dark_gold())
+    embed.add_field(name="方程式", value=f"`{equation}`", inline=False)
+    embed.add_field(name="解", value=f"`{solutions_text}`", inline=False)
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+
+    image_buf = create_solution_plot_image(solutions)
+    if image_buf is not None:
+        embed.set_image(url="attachment://solve.png")
+        await interaction.followup.send(embed=embed, file=discord.File(image_buf, filename="solve.png"))
+    else:
+        embed.set_footer(text=f"実行者: {interaction.user.display_name} ｜ 複素数解のため図は省略")
+        await interaction.followup.send(embed=embed)
 
 
 # ============================================================
