@@ -9,7 +9,9 @@
      (反映まで最大1時間かかることがある)でDiscord側に反映される
 """
 
+import asyncio
 import os
+from datetime import datetime, timedelta
 from typing import Optional
 
 import discord
@@ -35,6 +37,7 @@ from charts import (
     parse_paired_number_input,
 )
 from keep_alive import keep_alive
+import google_calendar
 import productivity
 
 # ============================================================
@@ -96,6 +99,7 @@ async def on_ready():
     print(f"✅ ログインしました: {bot.user}")
 
     await productivity.init_db()
+    google_calendar.init_db()  # 同期関数(sqlite3を直接使用)
     if not reminder_check_loop.is_running():
         reminder_check_loop.start()
 
@@ -519,6 +523,197 @@ async def todo_clear(interaction: discord.Interaction):
 
 
 bot.tree.add_command(todo_group)
+
+
+# ============================================================
+# /calendar グループ: Googleカレンダー連携(認証まわり)
+# ============================================================
+
+calendar_group = app_commands.Group(name="calendar", description="Googleカレンダー連携")
+
+
+@calendar_group.command(name="connect", description="Googleカレンダーと連携するための認証リンクを発行します")
+async def calendar_connect(interaction: discord.Interaction):
+    try:
+        auth_url = await asyncio.to_thread(google_calendar.build_authorize_url, interaction.user.id)
+    except google_calendar.CalendarError as e:
+        await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        "以下のリンクからGoogleアカウントで認証してください(10分間有効です)。\n"
+        "**このリンクはあなた専用です。他の人と共有しないでください。**\n"
+        f"{auth_url}",
+        ephemeral=True,
+    )
+
+
+@calendar_group.command(name="disconnect", description="Googleカレンダーとの連携を解除します")
+async def calendar_disconnect(interaction: discord.Interaction):
+    ok = await asyncio.to_thread(google_calendar.disconnect, interaction.user.id)
+    if ok:
+        await interaction.response.send_message("🔌 Googleカレンダーとの連携を解除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("連携されていません。", ephemeral=True)
+
+
+@calendar_group.command(name="status", description="Googleカレンダーとの連携状況を確認します")
+async def calendar_status(interaction: discord.Interaction):
+    connected = await asyncio.to_thread(google_calendar.is_connected, interaction.user.id)
+    if connected:
+        await interaction.response.send_message("✅ Googleカレンダーと連携済みです。", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "未連携です。`/calendar connect` で連携できます。", ephemeral=True
+        )
+
+
+bot.tree.add_command(calendar_group)
+
+
+# ============================================================
+# /schedule グループ: Googleカレンダー上の予定の登録・確認・削除
+# ============================================================
+
+schedule_group = app_commands.Group(name="schedule", description="Googleカレンダーと連携した予定管理")
+
+
+@schedule_group.command(name="add", description="Googleカレンダーに予定を登録します")
+@app_commands.describe(
+    title="予定のタイトル",
+    start="開始日時 (例: `2026-09-20 21:00`, `21:00`, `10m`のような相対時間も可。all_day時は`2026-09-20`のような日付)",
+    duration="所要時間 (例: `1h`, `30m`。省略時は1時間。all_day指定時は無視されます)",
+    location="場所(省略可)",
+    description="メモ・説明(省略可)",
+    all_day="終日の予定として登録するか(省略時: しない)",
+)
+async def schedule_add(
+    interaction: discord.Interaction,
+    title: str,
+    start: str,
+    duration: str = "1h",
+    location: Optional[str] = None,
+    description: Optional[str] = None,
+    all_day: bool = False,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        if all_day:
+            start_date = productivity.parse_date_jst(start)
+            start_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=productivity.JST)
+            end_dt = start_dt + timedelta(days=1)
+        else:
+            start_dt = productivity.parse_when(start)
+            end_dt = start_dt + productivity.parse_duration(duration)
+    except productivity.ProductivityError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    try:
+        event = await asyncio.to_thread(
+            google_calendar.create_event,
+            interaction.user.id,
+            title,
+            start_dt,
+            end_dt,
+            all_day,
+            location,
+            description,
+        )
+    except google_calendar.CalendarError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="🗓️ 予定を登録しました", color=discord.Color.green())
+    embed.add_field(name="タイトル", value=event.summary, inline=False)
+    if event.all_day:
+        embed.add_field(name="日付", value=f'{event.start.strftime("%Y-%m-%d")}(終日)', inline=False)
+    else:
+        embed.add_field(
+            name="日時",
+            value=f'{event.start.strftime("%Y-%m-%d %H:%M")} 〜 {event.end.strftime("%H:%M")} (JST)',
+            inline=False,
+        )
+    if event.location:
+        embed.add_field(name="場所", value=event.location, inline=False)
+    if event.html_link:
+        embed.add_field(name="Googleカレンダーで開く", value=event.html_link, inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@schedule_group.command(name="list", description="Googleカレンダーの予定を一覧表示します")
+@app_commands.describe(
+    when="表示する範囲の起点。省略時は今日 (例: `today`, `明日`, `2026-09-20`)",
+    days="何日分表示するか(省略時: 7日、最大31日)",
+)
+async def schedule_list(
+    interaction: discord.Interaction,
+    when: Optional[str] = None,
+    days: int = 7,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    days = max(1, min(days, 31))
+    try:
+        start_date = productivity.parse_date_jst(when) if when else productivity.parse_date_jst("today")
+    except productivity.ProductivityError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    range_start = datetime.combine(start_date, datetime.min.time(), tzinfo=productivity.JST)
+    range_end = range_start + timedelta(days=days)
+
+    try:
+        events = await asyncio.to_thread(
+            google_calendar.list_events, interaction.user.id, range_start, range_end
+        )
+    except google_calendar.CalendarError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    if not events:
+        await interaction.followup.send(
+            f"{range_start.strftime('%Y-%m-%d')} から{days}日間、予定はありません。", ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"🗓️ 予定一覧({range_start.strftime('%Y-%m-%d')} から{days}日間)",
+        color=discord.Color.green(),
+    )
+    for ev in events[:20]:
+        if ev.all_day:
+            time_str = f'{ev.start.strftime("%Y-%m-%d")}(終日)'
+        else:
+            time_str = f'{ev.start.strftime("%Y-%m-%d %H:%M")} 〜 {ev.end.strftime("%H:%M")}'
+
+        value = f"{time_str}\nID: `{ev.event_id}`"
+        if ev.location:
+            value += f"\n📍 {ev.location}"
+
+        embed.add_field(name=ev.summary, value=value, inline=False)
+
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@schedule_group.command(name="remove", description="指定したIDの予定を削除します(`/schedule list`のIDを指定)")
+@app_commands.describe(event_id="削除する予定のID(`/schedule list`の結果に表示されるIDをコピー)")
+async def schedule_remove(interaction: discord.Interaction, event_id: str):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await asyncio.to_thread(google_calendar.delete_event, interaction.user.id, event_id)
+    except google_calendar.CalendarError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    await interaction.followup.send("🗑️ 予定を削除しました。", ephemeral=True)
+
+
+bot.tree.add_command(schedule_group)
 
 
 # ============================================================
