@@ -14,7 +14,7 @@ from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from charts import (
     DataParseError,
@@ -35,6 +35,7 @@ from charts import (
     parse_paired_number_input,
 )
 from keep_alive import keep_alive
+import productivity
 
 # ============================================================
 # Bot初期設定
@@ -58,12 +59,45 @@ GUILD_OBJECT = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 
 
 # ============================================================
-# 起動時イベント:スラッシュコマンドの同期
+# リマインダーの監視ループ
+# 30秒おきにDBを確認し、通知時刻を過ぎた未通知のリマインダーを送信する
+# ============================================================
+
+@tasks.loop(seconds=30)
+async def reminder_check_loop():
+    due = await productivity.due_reminders()
+    for reminder in due:
+        channel = bot.get_channel(reminder.channel_id)
+        try:
+            if channel is None:
+                channel = await bot.fetch_channel(reminder.channel_id)
+            await channel.send(
+                f"⏰ <@{reminder.user_id}> リマインダーの時間です: {reminder.message}"
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            # チャンネル削除・権限喪失などで送信できない場合はログだけ残す
+            print(f"⚠️ リマインダー送信に失敗しました (id={reminder.id}): {e}")
+        finally:
+            # 送信の成否に関わらず、同じ内容を送り続けないよう既読扱いにする
+            await productivity.mark_notified(reminder.id)
+
+
+@reminder_check_loop.before_loop
+async def before_reminder_check_loop():
+    await bot.wait_until_ready()
+
+
+# ============================================================
+# 起動時イベント:DB初期化・リマインダーループ開始・スラッシュコマンドの同期
 # ============================================================
 
 @bot.event
 async def on_ready():
     print(f"✅ ログインしました: {bot.user}")
+
+    await productivity.init_db()
+    if not reminder_check_loop.is_running():
+        reminder_check_loop.start()
 
     try:
         if GUILD_OBJECT is not None:
@@ -346,6 +380,145 @@ async def solve(interaction: discord.Interaction, equation: str):
     else:
         embed.set_footer(text=f"実行者: {interaction.user.display_name} ｜ 複素数解のため図は省略")
         await interaction.followup.send(embed=embed)
+
+
+# ============================================================
+# /remind グループ: リマインダー機能
+# ============================================================
+
+remind_group = app_commands.Group(name="remind", description="リマインダー機能")
+
+
+@remind_group.command(name="set", description="指定した時間後、または日時にリマインドします")
+@app_commands.describe(
+    when="いつ通知するか (例: `10m`=10分後, `1h30m`, `3d`, `2026-09-20 21:00`, `21:00`)",
+    message="リマインドしてほしい内容",
+)
+async def remind_set(interaction: discord.Interaction, when: str, message: str):
+    try:
+        remind_at = productivity.parse_when(when)
+        reminder_id = await productivity.add_reminder(
+            user_id=interaction.user.id,
+            channel_id=interaction.channel_id,
+            message=message,
+            remind_at=remind_at,
+        )
+    except productivity.ProductivityError as e:
+        await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="⏰ リマインダーを設定しました", color=discord.Color.orange())
+    embed.add_field(name="内容", value=message, inline=False)
+    embed.add_field(name="通知予定時刻", value=productivity.format_jst(remind_at), inline=False)
+    embed.set_footer(text=f"ID: {reminder_id} ｜ 実行者: {interaction.user.display_name}")
+
+    await interaction.response.send_message(embed=embed)
+
+
+@remind_group.command(name="list", description="設定中の自分のリマインダー一覧を表示します")
+async def remind_list(interaction: discord.Interaction):
+    reminders = await productivity.list_reminders(interaction.user.id)
+
+    if not reminders:
+        await interaction.response.send_message("設定中のリマインダーはありません。", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="⏰ 設定中のリマインダー", color=discord.Color.orange())
+    for r in reminders[:20]:
+        embed.add_field(
+            name=f"ID: {r.id} ｜ {productivity.format_jst(r.remind_at)}",
+            value=r.message,
+            inline=False,
+        )
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@remind_group.command(name="cancel", description="指定したIDのリマインダーを取り消します")
+@app_commands.describe(reminder_id="取り消すリマインダーのID(`/remind list`で確認できます)")
+async def remind_cancel(interaction: discord.Interaction, reminder_id: int):
+    ok = await productivity.cancel_reminder(interaction.user.id, reminder_id)
+    if ok:
+        await interaction.response.send_message(
+            f"🗑️ リマインダー(ID: {reminder_id})を取り消しました。", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "⚠️ 指定したIDのリマインダーが見つかりませんでした(すでに通知済み、または他人のリマインダーの可能性があります)。",
+            ephemeral=True,
+        )
+
+
+bot.tree.add_command(remind_group)
+
+
+# ============================================================
+# /todo グループ: ToDoリスト機能
+# ============================================================
+
+todo_group = app_commands.Group(name="todo", description="ToDoリスト機能")
+
+
+@todo_group.command(name="add", description="ToDoリストに項目を追加します")
+@app_commands.describe(content="追加するタスクの内容")
+async def todo_add(interaction: discord.Interaction, content: str):
+    try:
+        todo_id = await productivity.add_todo(interaction.user.id, content)
+    except productivity.ProductivityError as e:
+        await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+        return
+
+    await interaction.response.send_message(f"✅ 追加しました(ID: {todo_id}): {content}", ephemeral=True)
+
+
+@todo_group.command(name="list", description="自分のToDoリストを表示します")
+@app_commands.describe(include_done="完了済みのタスクも表示するか(省略時は表示しない)")
+async def todo_list(interaction: discord.Interaction, include_done: bool = False):
+    items = await productivity.list_todos(interaction.user.id, include_done=include_done)
+
+    if not items:
+        await interaction.response.send_message("ToDoリストは空です。", ephemeral=True)
+        return
+
+    lines = [f'{"✅" if item.done else "🔲"} `{item.id}` {item.content}' for item in items]
+
+    embed = discord.Embed(title="📝 ToDoリスト", description="\n".join(lines), color=discord.Color.blue())
+    embed.set_footer(text=f"実行者: {interaction.user.display_name}")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@todo_group.command(name="done", description="指定したIDのタスクを完了にします")
+@app_commands.describe(todo_id="完了にするタスクのID(`/todo list`で確認できます)")
+async def todo_done(interaction: discord.Interaction, todo_id: int):
+    ok = await productivity.complete_todo(interaction.user.id, todo_id)
+    if ok:
+        await interaction.response.send_message(f"✅ タスク(ID: {todo_id})を完了にしました。", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            "⚠️ 指定したIDのタスクが見つかりませんでした(すでに完了済み、または他人のタスクの可能性があります)。",
+            ephemeral=True,
+        )
+
+
+@todo_group.command(name="remove", description="指定したIDのタスクを削除します")
+@app_commands.describe(todo_id="削除するタスクのID(`/todo list`で確認できます)")
+async def todo_remove(interaction: discord.Interaction, todo_id: int):
+    ok = await productivity.delete_todo(interaction.user.id, todo_id)
+    if ok:
+        await interaction.response.send_message(f"🗑️ タスク(ID: {todo_id})を削除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("⚠️ 指定したIDのタスクが見つかりませんでした。", ephemeral=True)
+
+
+@todo_group.command(name="clear", description="完了済みのタスクをまとめて削除します")
+async def todo_clear(interaction: discord.Interaction):
+    count = await productivity.clear_done_todos(interaction.user.id)
+    await interaction.response.send_message(f"🧹 完了済みのタスクを{count}件削除しました。", ephemeral=True)
+
+
+bot.tree.add_command(todo_group)
 
 
 # ============================================================
