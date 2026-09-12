@@ -31,6 +31,11 @@ from pathlib import Path
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
+# Googleから返るスコープの並び順・内容がリクエスト時とわずかに異なるだけで
+# oauthlib が例外を投げてしまう既知の問題があるため、厳密一致チェックを緩める。
+# (fetch_token() を呼ぶより前に設定されていれば良い)
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -184,7 +189,15 @@ def handle_oauth_callback(state: str, code: str) -> int:
     discord_user_id = _pop_oauth_state(state)
 
     flow = _build_flow()
-    flow.fetch_token(code=code)
+    try:
+        flow.fetch_token(code=code)
+    except Exception as e:
+        # oauthlib/requests側の様々な例外(invalid_grant, スコープ不一致など)をここで吸収する
+        print(f"[google_calendar] トークン交換に失敗しました: {e!r}")
+        raise CalendarError(
+            "Googleとのトークン交換に失敗しました。認証リンクは1回しか使えないため、"
+            "もう一度 `/calendar connect` からやり直してください。"
+        )
     creds = flow.credentials
 
     if not creds.refresh_token:
