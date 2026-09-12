@@ -76,6 +76,22 @@ class ScheduleEvent:
     html_link: Optional[str]
 
 
+_WEEKDAY_JA = ("月", "火", "水", "木", "金", "土", "日")
+
+
+def weekday_ja(d) -> str:
+    """date/datetimeの曜日を日本語の1文字("月"〜"日")で返す"""
+    return _WEEKDAY_JA[d.weekday()]
+
+
+def format_event_time_range(ev: ScheduleEvent) -> str:
+    """予定の日付・曜日・時刻をまとめた短い文字列を返す(一覧表示・削除メニュー共通)"""
+    date_part = f"{ev.start.strftime('%m/%d')}({weekday_ja(ev.start)})"
+    if ev.all_day:
+        return f"{date_part} 終日"
+    return f"{date_part} {ev.start.strftime('%H:%M')}〜{ev.end.strftime('%H:%M')}"
+
+
 def _require_config() -> None:
     if not (CLIENT_ID and CLIENT_SECRET and REDIRECT_URI):
         raise CalendarError(
