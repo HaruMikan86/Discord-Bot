@@ -40,6 +40,14 @@ def oauth2callback():
         google_calendar.handle_oauth_callback(state, code)
     except google_calendar.CalendarError as e:
         return f"連携に失敗しました: {e}", 400
+    except Exception as e:
+        # 想定外のエラー。詳細はRenderのログに残し、ユーザーには分かりやすい案内だけ返す
+        print(f"[oauth2callback] 予期しないエラー: {e!r}")
+        return (
+            "予期しないエラーが発生しました。お手数ですが、"
+            "もう一度 `/calendar connect` からやり直してください。",
+            500,
+        )
 
     return "✅ Googleカレンダーとの連携が完了しました。このタブは閉じてDiscordに戻ってください。"
 
