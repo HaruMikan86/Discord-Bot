@@ -14,8 +14,11 @@ Googleカレンダー連携用モジュール。
   GOOGLE_REDIRECT_URI   例: https://<Renderのアプリ名>.onrender.com/oauth2callback
                         (Google Cloud Consoleの「承認済みのリダイレクトURI」と完全一致させること)
 
-スコープは calendar.events (予定の読み書きのみ。カレンダー自体の作成/削除や
-その他のGoogleアカウント情報へのアクセス権は含まない) に限定している。
+スコープは以下の2つに限定している(カレンダー自体の作成/削除やその他のGoogleアカウント
+情報へのアクセス権は含まない):
+  - calendar.events   予定の読み書き(/schedule add, list, remove で使用)
+  - calendar.freebusy 空き状況(busy/freeのみ、予定の詳細は含まない)の閲覧
+                      (/schedule freebusy で、共有を許可した相手のものだけ使用)
 
 注意: リフレッシュトークンは、そのユーザーの実際のGoogleカレンダーに
 継続的にアクセスできる鍵。DBファイル(data/bot.db)の取り扱いには
@@ -45,8 +48,10 @@ from googleapiclient.errors import HttpError
 JST = ZoneInfo("Asia/Tokyo")
 DB_PATH = Path(__file__).resolve().parent / "data" / "bot.db"
 
-# 予定の読み書きのみ(カレンダー一覧の変更やその他のスコープは要求しない)
-SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.freebusy",
+]
 
 CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -79,6 +84,12 @@ class ScheduleEvent:
 _WEEKDAY_JA = ("月", "火", "水", "木", "金", "土", "日")
 
 
+@dataclass
+class BusyPeriod:
+    start: datetime  # JSTのaware datetime
+    end: datetime
+
+
 def weekday_ja(d) -> str:
     """date/datetimeの曜日を日本語の1文字("月"〜"日")で返す"""
     return _WEEKDAY_JA[d.weekday()]
@@ -109,7 +120,8 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS google_tokens (
                 discord_user_id INTEGER PRIMARY KEY,
                 refresh_token TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                share_freebusy INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -122,6 +134,12 @@ def init_db() -> None:
             )
             """
         )
+
+        # このカラムが無いまま運用していた既存DB向けのマイグレーション
+        columns = [row[1] for row in db.execute("PRAGMA table_info(google_tokens)").fetchall()]
+        if "share_freebusy" not in columns:
+            db.execute("ALTER TABLE google_tokens ADD COLUMN share_freebusy INTEGER NOT NULL DEFAULT 0")
+
         db.commit()
 
 
@@ -257,6 +275,32 @@ def disconnect(discord_user_id: int) -> bool:
         return cursor.rowcount > 0
 
 
+def set_share_freebusy(discord_user_id: int, enabled: bool) -> bool:
+    """
+    自分の空き状況(予定の詳細を含まないbusy/free情報)を、他の人が
+    `/schedule freebusy` で確認できるようにするか設定する(オプトイン)。
+    戻り値: 連携済みで設定できればTrue、未連携ならFalse
+    """
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.execute(
+            "UPDATE google_tokens SET share_freebusy = ? WHERE discord_user_id = ?",
+            (1 if enabled else 0, discord_user_id),
+        )
+        db.commit()
+        return cursor.rowcount > 0
+
+
+def is_freebusy_shared(discord_user_id: int) -> bool:
+    """そのユーザーが空き状況の共有を許可しているか(未連携なら常にFalse)"""
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.execute(
+            "SELECT share_freebusy FROM google_tokens WHERE discord_user_id = ?",
+            (discord_user_id,),
+        )
+        row = cursor.fetchone()
+    return bool(row and row[0])
+
+
 # ============================================================
 # Calendar API 呼び出し
 # すべて同期(blocking)関数。discord.py側からは asyncio.to_thread 経由で呼ぶこと。
@@ -283,7 +327,13 @@ def _load_credentials(discord_user_id: int) -> Credentials:
         client_secret=CLIENT_SECRET,
         scopes=SCOPES,
     )
-    creds.refresh(Request())
+    try:
+        creds.refresh(Request())
+    except Exception as e:
+        raise CalendarError(
+            "Googleカレンダーへのアクセスに失敗しました。連携が解除された可能性があるため、"
+            "`/calendar disconnect` のあと `/calendar connect` からやり直してください。"
+        ) from e
     return creds
 
 
@@ -394,3 +444,38 @@ def delete_event(discord_user_id: int, event_id: str) -> None:
         if getattr(e, "resp", None) is not None and e.resp.status == 404:
             raise CalendarError("指定した予定が見つかりませんでした(すでに削除済みの可能性があります)。")
         raise CalendarError(f"予定の削除に失敗しました: {e}")
+
+
+def _parse_google_datetime(value: str) -> datetime:
+    """GoogleAPIが返す 'Z' 終端のUTC時刻表記もまとめて解釈する"""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def get_free_busy(discord_user_id: int, start: datetime, end: datetime) -> List[BusyPeriod]:
+    """
+    指定期間内の「忙しい」時間帯だけを取得する(予定のタイトル・場所・説明などの
+    詳細は一切含まない)。discord_user_id は、確認したい相手(共有を許可した側)のもの。
+    """
+    service = _build_service(discord_user_id)
+    body = {
+        "timeMin": start.astimezone(timezone.utc).isoformat(),
+        "timeMax": end.astimezone(timezone.utc).isoformat(),
+        "items": [{"id": "primary"}],
+    }
+    try:
+        response = service.freebusy().query(body=body).execute()
+    except HttpError as e:
+        raise CalendarError(
+            f"空き状況の取得に失敗しました: {e}\n"
+            "権限不足のエラーの場合、対象の方が `/calendar connect` をやり直して"
+            "権限を再取得する必要があります。"
+        )
+
+    busy_raw = response.get("calendars", {}).get("primary", {}).get("busy", [])
+    return [
+        BusyPeriod(
+            start=_parse_google_datetime(item["start"]).astimezone(JST),
+            end=_parse_google_datetime(item["end"]).astimezone(JST),
+        )
+        for item in busy_raw
+    ]
