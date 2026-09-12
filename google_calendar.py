@@ -127,6 +127,11 @@ def _build_flow() -> Flow:
         },
         scopes=SCOPES,
         redirect_uri=REDIRECT_URI,
+        # google-auth-oauthlib はデフォルトでPKCEのcode_verifierを自動生成するが、
+        # 認可URL発行(/calendar connect)とトークン交換(/oauth2callback)は
+        # 別々のFlowインスタンス(別リクエスト)になるため、verifierを引き継げず
+        # 「Missing code verifier」で失敗してしまう。ここでは無効化して回避する。
+        autogenerate_code_verifier=False,
     )
 
 
