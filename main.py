@@ -11,8 +11,8 @@
 
 import asyncio
 import os
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import date, datetime, timedelta
+from typing import List, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -679,38 +679,150 @@ async def schedule_list(
         )
         return
 
+    # 日付ごとにグループ化する(events は開始時刻順に並んでいるので、
+    # 同じ日付は必ず連続して現れる)
+    grouped: List[Tuple[date, List[google_calendar.ScheduleEvent]]] = []
+    for ev in events:
+        day = ev.start.date()
+        if grouped and grouped[-1][0] == day:
+            grouped[-1][1].append(ev)
+        else:
+            grouped.append((day, [ev]))
+
     embed = discord.Embed(
         title=f"🗓️ 予定一覧({range_start.strftime('%Y-%m-%d')} から{days}日間)",
         color=discord.Color.green(),
     )
-    for ev in events[:20]:
-        if ev.all_day:
-            time_str = f'{ev.start.strftime("%Y-%m-%d")}(終日)'
-        else:
-            time_str = f'{ev.start.strftime("%Y-%m-%d %H:%M")} 〜 {ev.end.strftime("%H:%M")}'
+    for day, day_events in grouped:
+        header = f"{day.strftime('%m/%d')}({google_calendar.weekday_ja(day)})"
 
-        value = f"{time_str}\nID: `{ev.event_id}`"
-        if ev.location:
-            value += f"\n📍 {ev.location}"
+        lines = []
+        for ev in day_events:
+            icon = "📌" if ev.all_day else "🕒"
+            time_part = "終日" if ev.all_day else f'{ev.start.strftime("%H:%M")}〜{ev.end.strftime("%H:%M")}'
+            line = f"{icon} {time_part} {ev.summary}"
+            if ev.location:
+                line += f"\n　📍 {ev.location}"
+            lines.append(line)
 
-        embed.add_field(name=ev.summary, value=value, inline=False)
+        value = "\n".join(lines)
+        if len(value) > 1024:
+            value = value[:1000] + "\n…(表示しきれない予定があります)"
+
+        embed.add_field(name=header, value=value, inline=False)
 
     embed.set_footer(text=f"実行者: {interaction.user.display_name}")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@schedule_group.command(name="remove", description="指定したIDの予定を削除します(`/schedule list`のIDを指定)")
-@app_commands.describe(event_id="削除する予定のID(`/schedule list`の結果に表示されるIDをコピー)")
-async def schedule_remove(interaction: discord.Interaction, event_id: str):
+# ============================================================
+# /schedule remove: ドロップダウンから選んで予定を削除する
+# ============================================================
+
+_REMOVE_SELECT_MAX_OPTIONS = 25  # DiscordのSelectメニューは最大25件まで
+_REMOVE_VIEW_TIMEOUT_SECONDS = 120
+
+
+class ScheduleRemoveView(discord.ui.View):
+    """/schedule remove で使う、削除したい予定を選ぶためのドロップダウン付きView"""
+
+    def __init__(self, discord_user_id: int, events: List[google_calendar.ScheduleEvent]):
+        super().__init__(timeout=_REMOVE_VIEW_TIMEOUT_SECONDS)
+        self.discord_user_id = discord_user_id
+        self.message: Optional[discord.WebhookMessage] = None
+        self._events_by_id = {ev.event_id: ev for ev in events}
+
+        select = discord.ui.Select(
+            placeholder="削除する予定を選んでください",
+            options=[
+                discord.SelectOption(
+                    label=f"{google_calendar.format_event_time_range(ev)} {ev.summary}"[:100],
+                    description=(ev.location or None) and ev.location[:100],
+                    value=ev.event_id,
+                )
+                for ev in events
+            ],
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        event_id = interaction.data["values"][0]
+        ev = self._events_by_id.get(event_id)
+
+        try:
+            await asyncio.to_thread(google_calendar.delete_event, self.discord_user_id, event_id)
+        except google_calendar.CalendarError as e:
+            await interaction.response.edit_message(content=f"⚠️ {e}", view=None, embed=None)
+            self.stop()
+            return
+
+        title = ev.summary if ev is not None else "予定"
+        await interaction.response.edit_message(content=f"🗑️ 「{title}」を削除しました。", view=None, embed=None)
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message is None:
+            return
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.message.edit(
+                content="⌛ タイムアウトしました。もう一度 `/schedule remove` を実行してください。",
+                view=self,
+            )
+        except discord.HTTPException:
+            pass  # メッセージが既に消えている等は無視してよい
+
+
+@schedule_group.command(name="remove", description="予定を選んで削除します")
+@app_commands.describe(
+    when="検索する範囲の起点。省略時は今日 (例: `today`, `明日`, `2026-09-20`)",
+    days="何日分から探すか(省略時: 30日、最大60日)",
+)
+async def schedule_remove(
+    interaction: discord.Interaction,
+    when: Optional[str] = None,
+    days: int = 30,
+):
     await interaction.response.defer(ephemeral=True)
 
+    days = max(1, min(days, 60))
     try:
-        await asyncio.to_thread(google_calendar.delete_event, interaction.user.id, event_id)
+        start_date = productivity.parse_date_jst(when) if when else productivity.parse_date_jst("today")
+    except productivity.ProductivityError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    range_start = datetime.combine(start_date, datetime.min.time(), tzinfo=productivity.JST)
+    range_end = range_start + timedelta(days=days)
+
+    try:
+        events = await asyncio.to_thread(
+            google_calendar.list_events,
+            interaction.user.id,
+            range_start,
+            range_end,
+            _REMOVE_SELECT_MAX_OPTIONS,
+        )
     except google_calendar.CalendarError as e:
         await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
         return
 
-    await interaction.followup.send("🗑️ 予定を削除しました。", ephemeral=True)
+    if not events:
+        await interaction.followup.send(
+            f"{range_start.strftime('%Y-%m-%d')} から{days}日間、削除できる予定が見つかりませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    view = ScheduleRemoveView(interaction.user.id, events)
+    message = await interaction.followup.send(
+        "削除する予定をメニューから選んでください(2分経つと無効になります)。",
+        view=view,
+        ephemeral=True,
+    )
+    view.message = message
 
 
 bot.tree.add_command(schedule_group)
