@@ -10,7 +10,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -182,6 +182,45 @@ def parse_when(text: str, now: Optional[datetime] = None) -> datetime:
         "日時の形式を認識できませんでした。\n"
         "・相対時間: `10m`(10分後) / `1h30m`(1時間30分後) / `3d`(3日後)\n"
         "・絶対日時(JST): `2026-09-20 21:00` / `09-20 21:00` / `21:00`"
+    )
+
+
+_DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%m-%d", "%m/%d")
+
+
+def parse_date_jst(text: str, now: Optional[datetime] = None) -> date:
+    """
+    "today"/"今日"、"tomorrow"/"明日"、または "2026-09-20"/"09-20" のような
+    日付文字列(JST基準)を date に変換する。/schedule 系コマンドで、
+    終日の予定の日付や、一覧表示の起点日を指定するのに使う。
+    年を省略した場合は今年、すでに過ぎていれば来年として扱う。
+    """
+    now = now or datetime.now(timezone.utc)
+    now_jst_date = now.astimezone(JST).date()
+
+    stripped = text.strip()
+    lowered = stripped.lower()
+    if lowered in ("today", "今日"):
+        return now_jst_date
+    if lowered in ("tomorrow", "明日"):
+        return now_jst_date + timedelta(days=1)
+
+    for fmt in _DATE_FORMATS:
+        try:
+            naive = datetime.strptime(stripped, fmt)
+        except ValueError:
+            continue
+
+        parsed_date = naive.date()
+        if fmt in ("%m-%d", "%m/%d"):
+            parsed_date = parsed_date.replace(year=now_jst_date.year)
+            if parsed_date < now_jst_date:
+                parsed_date = parsed_date.replace(year=parsed_date.year + 1)
+
+        return parsed_date
+
+    raise ProductivityError(
+        "日付の形式を認識できませんでした(例: `today`, `明日`, `2026-09-20`, `09-20`)。"
     )
 
 
