@@ -560,12 +560,42 @@ async def calendar_disconnect(interaction: discord.Interaction):
 @calendar_group.command(name="status", description="Googleカレンダーとの連携状況を確認します")
 async def calendar_status(interaction: discord.Interaction):
     connected = await asyncio.to_thread(google_calendar.is_connected, interaction.user.id)
-    if connected:
-        await interaction.response.send_message("✅ Googleカレンダーと連携済みです。", ephemeral=True)
-    else:
+    if not connected:
         await interaction.response.send_message(
             "未連携です。`/calendar connect` で連携できます。", ephemeral=True
         )
+        return
+
+    shared = await asyncio.to_thread(google_calendar.is_freebusy_shared, interaction.user.id)
+    share_status = "共有中" if shared else "共有していません"
+    await interaction.response.send_message(
+        f"✅ Googleカレンダーと連携済みです。\n"
+        f"空き状況の共有(`/schedule freebusy`用): {share_status}(`/calendar share`で切り替えられます)",
+        ephemeral=True,
+    )
+
+
+@calendar_group.command(name="share", description="自分の空き状況を他の人が確認できるようにするか設定します")
+@app_commands.describe(
+    enabled="他の人が`/schedule freebusy`であなたの空き状況(予定の詳細は含まない)を確認できるようにするか"
+)
+async def calendar_share(interaction: discord.Interaction, enabled: bool):
+    ok = await asyncio.to_thread(google_calendar.set_share_freebusy, interaction.user.id, enabled)
+    if not ok:
+        await interaction.response.send_message(
+            "Googleカレンダーと連携されていません。先に `/calendar connect` で連携してください。",
+            ephemeral=True,
+        )
+        return
+
+    if enabled:
+        await interaction.response.send_message(
+            "✅ 他の人が `/schedule freebusy` であなたの空き状況(タイトルや場所などの詳細は含みません)を"
+            "確認できるようになりました。`/calendar share enabled:False` でいつでも止められます。",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message("🔒 空き状況の共有を停止しました。", ephemeral=True)
 
 
 bot.tree.add_command(calendar_group)
@@ -647,19 +677,22 @@ async def schedule_add(
 @app_commands.describe(
     when="表示する範囲の起点。省略時は今日 (例: `today`, `明日`, `2026-09-20`)",
     days="何日分表示するか(省略時: 7日、最大31日)",
+    share="このチャンネルの全員に見えるように投稿するか(省略時: 自分にしか見えない)",
 )
 async def schedule_list(
     interaction: discord.Interaction,
     when: Optional[str] = None,
     days: int = 7,
+    share: bool = False,
 ):
-    await interaction.response.defer(ephemeral=True)
+    ephemeral = not share
+    await interaction.response.defer(ephemeral=ephemeral)
 
     days = max(1, min(days, 31))
     try:
         start_date = productivity.parse_date_jst(when) if when else productivity.parse_date_jst("today")
     except productivity.ProductivityError as e:
-        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=ephemeral)
         return
 
     range_start = datetime.combine(start_date, datetime.min.time(), tzinfo=productivity.JST)
@@ -670,12 +703,12 @@ async def schedule_list(
             google_calendar.list_events, interaction.user.id, range_start, range_end
         )
     except google_calendar.CalendarError as e:
-        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=ephemeral)
         return
 
     if not events:
         await interaction.followup.send(
-            f"{range_start.strftime('%Y-%m-%d')} から{days}日間、予定はありません。", ephemeral=True
+            f"{range_start.strftime('%Y-%m-%d')} から{days}日間、予定はありません。", ephemeral=ephemeral
         )
         return
 
@@ -712,7 +745,7 @@ async def schedule_list(
         embed.add_field(name=header, value=value, inline=False)
 
     embed.set_footer(text=f"実行者: {interaction.user.display_name}")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=ephemeral)
 
 
 # ============================================================
@@ -823,6 +856,72 @@ async def schedule_remove(
         ephemeral=True,
     )
     view.message = message
+
+
+@schedule_group.command(name="freebusy", description="共有を許可された相手の空き状況(予定の詳細は含まない)を確認します")
+@app_commands.describe(
+    user="空き状況を確認したい相手(`/calendar share`で共有を許可している必要があります)",
+    when="確認する範囲の起点。省略時は今日 (例: `today`, `明日`, `2026-09-20`)",
+    days="何日分確認するか(省略時: 1日、最大7日)",
+)
+async def schedule_freebusy(
+    interaction: discord.Interaction,
+    user: discord.User,
+    when: Optional[str] = None,
+    days: int = 1,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if user.id == interaction.user.id:
+        await interaction.followup.send("自分の予定は `/schedule list` で確認できます。", ephemeral=True)
+        return
+
+    shared = await asyncio.to_thread(google_calendar.is_freebusy_shared, user.id)
+    if not shared:
+        await interaction.followup.send(
+            f"{user.display_name} さんは空き状況の共有を許可していません。", ephemeral=True
+        )
+        return
+
+    days = max(1, min(days, 7))
+    try:
+        start_date = productivity.parse_date_jst(when) if when else productivity.parse_date_jst("today")
+    except productivity.ProductivityError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    range_start = datetime.combine(start_date, datetime.min.time(), tzinfo=productivity.JST)
+    range_end = range_start + timedelta(days=days)
+
+    try:
+        busy_periods = await asyncio.to_thread(
+            google_calendar.get_free_busy, user.id, range_start, range_end
+        )
+    except google_calendar.CalendarError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🕓 {user.display_name} さんの空き状況({range_start.strftime('%Y-%m-%d')} から{days}日間)",
+        color=discord.Color.blue(),
+    )
+    if not busy_periods:
+        embed.description = "この期間はすべて空いています。"
+    else:
+        lines = []
+        for bp in busy_periods:
+            if bp.start.date() == bp.end.date():
+                line = (
+                    f"❌ {bp.start.strftime('%m/%d')}({google_calendar.weekday_ja(bp.start)}) "
+                    f"{bp.start.strftime('%H:%M')}〜{bp.end.strftime('%H:%M')}"
+                )
+            else:
+                line = f"❌ {bp.start.strftime('%m/%d %H:%M')} 〜 {bp.end.strftime('%m/%d %H:%M')}"
+            lines.append(line)
+        embed.description = "\n".join(lines)
+
+    embed.set_footer(text="※ 予定のタイトルや場所などの詳細は共有されません")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 bot.tree.add_command(schedule_group)
