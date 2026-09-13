@@ -929,6 +929,58 @@ bot.tree.add_command(schedule_group)
 
 
 # ============================================================
+# /admin グループ: 管理者向けコマンド(Bot所有者のみ実行可能)
+# ============================================================
+
+admin_group = app_commands.Group(name="admin", description="管理者向けコマンド")
+
+
+@admin_group.command(name="calendar_status", description="全員のGoogleカレンダー連携・共有状況を確認します(管理者専用)")
+async def admin_calendar_status(interaction: discord.Interaction):
+    if not await bot.is_owner(interaction.user):
+        await interaction.response.send_message(
+            "⚠️ このコマンドはBotの管理者のみ実行できます。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    rows = await asyncio.to_thread(google_calendar.list_all_connections)
+    if not rows:
+        await interaction.followup.send("連携しているユーザーはいません。", ephemeral=True)
+        return
+
+    lines = []
+    for discord_user_id, updated_at, share_freebusy in rows:
+        try:
+            user = await bot.fetch_user(discord_user_id)
+            name = getattr(user, "display_name", None) or user.name
+        except discord.NotFound:
+            name = f"(不明なユーザー: {discord_user_id})"
+
+        share_status = "🔓 共有中" if share_freebusy else "🔒 非共有"
+        lines.append(
+            f"`{discord_user_id}` {name}\n"
+            f"　連携日時: {productivity.format_jst(updated_at)} ｜ 空き状況の共有: {share_status}"
+        )
+
+    value = "\n".join(lines)
+    if len(value) > 4000:
+        value = value[:3960] + "\n…(表示しきれないユーザーがいます)"
+
+    embed = discord.Embed(
+        title="🛠️ Googleカレンダー連携状況",
+        description=value,
+        color=discord.Color.dark_grey(),
+    )
+    embed.set_footer(text=f"連携ユーザー数: {len(rows)}件")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(admin_group)
+
+
+# ============================================================
 # /help: 登録されているコマンドの一覧を自動生成して表示する
 #
 # 新しいコマンドを追加してもこのコードを触る必要はない。
@@ -944,6 +996,7 @@ _CATEGORY_EMOJIS = {
     "todo": "📝",
     "calendar": "🔑",
     "schedule": "🗓️",
+    "admin": "🛠️",
 }
 _DEFAULT_CATEGORY_EMOJI = "🔧"
 
