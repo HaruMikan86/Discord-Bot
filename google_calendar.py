@@ -31,7 +31,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 # Googleから返るスコープの並び順・内容がリクエスト時とわずかに異なるだけで
@@ -299,6 +299,22 @@ def is_freebusy_shared(discord_user_id: int) -> bool:
         )
         row = cursor.fetchone()
     return bool(row and row[0])
+
+
+def list_all_connections() -> List[Tuple[int, datetime, bool]]:
+    """
+    連携している全ユーザーの一覧を (discord_user_id, 連携日時(UTC aware), 空き状況共有の可否) で返す。
+    管理者向けの一覧表示コマンド(/admin calendar_status)から使う。
+    """
+    with sqlite3.connect(DB_PATH) as db:
+        rows = db.execute(
+            "SELECT discord_user_id, updated_at, share_freebusy FROM google_tokens "
+            "ORDER BY updated_at DESC"
+        ).fetchall()
+    return [
+        (discord_user_id, datetime.fromisoformat(updated_at), bool(share_freebusy))
+        for discord_user_id, updated_at, share_freebusy in rows
+    ]
 
 
 # ============================================================
