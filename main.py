@@ -11,6 +11,7 @@
 
 import asyncio
 import os
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import List, Optional, Tuple
 
@@ -925,6 +926,117 @@ async def schedule_freebusy(
 
 
 bot.tree.add_command(schedule_group)
+
+
+# ============================================================
+# /help: 登録されているコマンドの一覧を自動生成して表示する
+#
+# 新しいコマンドを追加してもこのコードを触る必要はない。
+#   - 新しい機能領域を追加するときは、/remind, /todo, /calendar, /schedule と
+#     同じように app_commands.Group でまとめると、グループ名がそのまま
+#     カテゴリの見出しになって自動的にここに表示される。
+#   - グループに属さない単独コマンド(/stats など)は「統計・グラフ」カテゴリに
+#     自動的にまとめられる。
+# ============================================================
+
+_CATEGORY_EMOJIS = {
+    "remind": "⏰",
+    "todo": "📝",
+    "calendar": "🔑",
+    "schedule": "🗓️",
+}
+_DEFAULT_CATEGORY_EMOJI = "🔧"
+
+_STANDALONE_KEY = "stats"
+_STANDALONE_EMOJI = "📊"
+_STANDALONE_LABEL = "統計・グラフ"
+
+
+@dataclass
+class CommandCategory:
+    key: str  # /help category:xxx で絞り込むための内部キー
+    label: str  # 表示用の見出し(絵文字付き)
+    entries: List[Tuple[str, str]]  # (コマンド名, 説明) のリスト
+
+
+def _collect_command_categories() -> List[CommandCategory]:
+    """bot.tree に登録されている全コマンドを走査し、カテゴリ単位にまとめる"""
+    categories: List[CommandCategory] = []
+    standalone: List[Tuple[str, str]] = []
+
+    for cmd in bot.tree.get_commands():
+        if isinstance(cmd, app_commands.Group):
+            emoji = _CATEGORY_EMOJIS.get(cmd.name, _DEFAULT_CATEGORY_EMOJI)
+            entries = [(f"/{cmd.name} {sub.name}", sub.description or "(説明なし)") for sub in cmd.commands]
+            categories.append(
+                CommandCategory(
+                    key=cmd.name,
+                    label=f"{emoji} /{cmd.name}({cmd.description})",
+                    entries=entries,
+                )
+            )
+        else:
+            standalone.append((f"/{cmd.name}", cmd.description or "(説明なし)"))
+
+    if standalone:
+        categories.insert(
+            0,
+            CommandCategory(
+                key=_STANDALONE_KEY,
+                label=f"{_STANDALONE_EMOJI} {_STANDALONE_LABEL}",
+                entries=standalone,
+            ),
+        )
+
+    return categories
+
+
+async def _help_category_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> List[app_commands.Choice[str]]:
+    categories = _collect_command_categories()
+    current_lower = current.lower()
+    matches = [
+        app_commands.Choice(name=c.label, value=c.key)
+        for c in categories
+        if current_lower in c.key.lower() or current_lower in c.label.lower()
+    ]
+    return matches[:25]
+
+
+@bot.tree.command(name="help", description="利用できるコマンドの一覧を表示します")
+@app_commands.describe(category="特定のカテゴリだけ詳しく見たい場合に指定(省略時は全カテゴリの概要)")
+@app_commands.autocomplete(category=_help_category_autocomplete)
+async def help_command(interaction: discord.Interaction, category: Optional[str] = None):
+    categories = _collect_command_categories()
+
+    if category:
+        matched = next((c for c in categories if c.key == category), None)
+        if matched is None:
+            await interaction.response.send_message(
+                f"⚠️ カテゴリ「{category}」が見つかりませんでした。"
+                "`/help` を引数なしで実行すると一覧が見られます。",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(title=matched.label, color=discord.Color.blurple())
+        embed.description = "\n\n".join(f"**{name}**\n{desc}" for name, desc in matched.entries)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📖 コマンド一覧",
+        description="カテゴリごとの概要です。`/help category:` で特定のカテゴリだけ詳しく見られます。",
+        color=discord.Color.blurple(),
+    )
+    for cat in categories:
+        value = "\n".join(f"`{name}` — {desc}" for name, desc in cat.entries)
+        if len(value) > 1024:
+            value = value[:1000] + "\n…(表示しきれないコマンドがあります)"
+        embed.add_field(name=cat.label, value=value, inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ============================================================
