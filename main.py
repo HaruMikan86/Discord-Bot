@@ -40,6 +40,7 @@ from charts import (
 from keep_alive import keep_alive
 import google_calendar
 import productivity
+import steam_integration
 
 # ============================================================
 # Bot初期設定
@@ -101,6 +102,7 @@ async def on_ready():
 
     await productivity.init_db()
     google_calendar.init_db()  # 同期関数(sqlite3を直接使用)
+    steam_integration.init_db()  # 同期関数(sqlite3を直接使用)
     if not reminder_check_loop.is_running():
         reminder_check_loop.start()
 
@@ -981,6 +983,172 @@ bot.tree.add_command(admin_group)
 
 
 # ============================================================
+# /steam グループ: Steam連携(所持ゲームの確認)
+#
+# 注意: GoogleカレンダーのようなOAuthの同意フローは無い。SteamのGetOwnedGames APIは
+# 対象プロフィールの「ゲームの詳細」プライバシー設定が公開になっている場合のみ
+# 情報を返す(Bot経由かどうかに関わらず誰でも取得できる情報)。/steam link は
+# アクセス許可を与える操作ではなく、DiscordアカウントとSteamIDを紐付けるだけ。
+# ============================================================
+
+steam_group = app_commands.Group(name="steam", description="Steam連携(所持ゲームの確認)")
+
+
+@steam_group.command(name="link", description="SteamアカウントをDiscordアカウントに紐付けます")
+@app_commands.describe(profile="SteamプロフィールのフルURL、vanity ID、またはSteamID64のいずれか")
+async def steam_link(interaction: discord.Interaction, profile: str):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        steam_id64, persona_name = await asyncio.to_thread(
+            steam_integration.link_account, interaction.user.id, profile
+        )
+    except steam_integration.SteamError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"✅ Steamアカウント「{persona_name}」と連携しました。", ephemeral=True
+    )
+
+
+@steam_group.command(name="unlink", description="Steamアカウントとの紐付けを解除します")
+async def steam_unlink(interaction: discord.Interaction):
+    ok = await asyncio.to_thread(steam_integration.unlink_account, interaction.user.id)
+    if ok:
+        await interaction.response.send_message("🔌 Steamアカウントとの連携を解除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("連携されていません。", ephemeral=True)
+
+
+@steam_group.command(name="games", description="所持しているSteamゲームの一覧を表示します")
+@app_commands.describe(user="確認したい相手(省略時は自分)")
+async def steam_games(interaction: discord.Interaction, user: Optional[discord.User] = None):
+    target = user or interaction.user
+    await interaction.response.defer(ephemeral=True)
+
+    steam_id64 = await asyncio.to_thread(steam_integration.get_linked_steam_id, target.id)
+    if steam_id64 is None:
+        who = "あなたは" if target.id == interaction.user.id else f"{target.display_name} さんは"
+        await interaction.followup.send(
+            f"{who}Steamアカウントを連携していません。`/steam link` で連携できます。", ephemeral=True
+        )
+        return
+
+    try:
+        games = await asyncio.to_thread(steam_integration.get_owned_games, steam_id64)
+    except steam_integration.SteamError as e:
+        await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        return
+
+    if not games:
+        await interaction.followup.send("所持しているゲームが見つかりませんでした。", ephemeral=True)
+        return
+
+    games = sorted(games, key=lambda g: -g.playtime_forever_minutes)
+    lines = [f"{g.name}(プレイ時間 {g.playtime_forever_minutes / 60:.0f}時間)" for g in games]
+    value = "\n".join(lines)
+    if len(value) > 4000:
+        value = value[:3960] + "\n…(表示しきれないタイトルがあります)"
+
+    embed = discord.Embed(
+        title=f"🎮 {target.display_name} さんの所持ゲーム(全{len(games)}本)",
+        description=value,
+        color=discord.Color.dark_blue(),
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@steam_group.command(
+    name="common", description="今いるボイスチャンネルのメンバーで共通して持っているゲームを表示します"
+)
+async def steam_common(interaction: discord.Interaction):
+    # 全員で見て決められるよう、この結果はチャンネルに公開する(ephemeralにしない)
+    await interaction.response.defer(ephemeral=False)
+
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if member is None or member.voice is None or member.voice.channel is None:
+        await interaction.followup.send("ボイスチャンネルに参加してから実行してください。")
+        return
+
+    channel_members = [m for m in member.voice.channel.members if not m.bot]
+    if len(channel_members) < 2:
+        await interaction.followup.send("ボイスチャンネルに2人以上いないと共通のゲームを計算できません。")
+        return
+
+    linked: List[Tuple[discord.Member, str]] = []
+    not_linked: List[discord.Member] = []
+    for m in channel_members:
+        steam_id64 = await asyncio.to_thread(steam_integration.get_linked_steam_id, m.id)
+        if steam_id64:
+            linked.append((m, steam_id64))
+        else:
+            not_linked.append(m)
+
+    if len(linked) < 2:
+        names = "、".join(m.display_name for m in channel_members)
+        await interaction.followup.send(
+            f"Steam連携済みのメンバーが2人未満です(現在のメンバー: {names})。"
+            "`/steam link` で連携してもらってから、もう一度実行してください。"
+        )
+        return
+
+    libraries: dict = {}
+    skipped: List[discord.Member] = []
+    for m, steam_id64 in linked:
+        try:
+            games = await asyncio.to_thread(steam_integration.get_owned_games, steam_id64)
+            libraries[m] = {g.appid: g for g in games}
+        except steam_integration.SteamError:
+            skipped.append(m)
+
+    if len(libraries) < 2:
+        await interaction.followup.send(
+            "所持ゲームを取得できたメンバーが2人未満でした(プロフィールが非公開の可能性があります)。"
+        )
+        return
+
+    appid_sets = [set(lib.keys()) for lib in libraries.values()]
+    common_appids = set.intersection(*appid_sets)
+
+    embed = discord.Embed(
+        title=f"🎮 共通所持ゲーム({len(libraries)}人: {', '.join(m.display_name for m in libraries)})",
+        color=discord.Color.dark_blue(),
+    )
+
+    if not common_appids:
+        embed.description = "共通して持っているゲームは見つかりませんでした。"
+    else:
+        summaries = []
+        for appid in common_appids:
+            any_game = next(lib[appid] for lib in libraries.values() if appid in lib)
+            total_minutes = sum(
+                lib[appid].playtime_forever_minutes for lib in libraries.values() if appid in lib
+            )
+            summaries.append((any_game.name, total_minutes))
+        summaries.sort(key=lambda x: -x[1])
+
+        lines = [f"{name}(合計 {minutes / 60:.0f}時間)" for name, minutes in summaries]
+        value = "\n".join(lines)
+        if len(value) > 4000:
+            value = value[:3960] + "\n…(表示しきれないタイトルがあります)"
+        embed.description = value
+
+    notes = []
+    if not_linked:
+        notes.append("未連携: " + "、".join(m.display_name for m in not_linked))
+    if skipped:
+        notes.append("取得失敗(非公開等): " + "、".join(m.display_name for m in skipped))
+    if notes:
+        embed.set_footer(text=" ｜ ".join(notes))
+
+    await interaction.followup.send(embed=embed)
+
+
+bot.tree.add_command(steam_group)
+
+
+# ============================================================
 # /help: 登録されているコマンドの一覧を自動生成して表示する
 #
 # 新しいコマンドを追加してもこのコードを触る必要はない。
@@ -997,6 +1165,7 @@ _CATEGORY_EMOJIS = {
     "calendar": "🔑",
     "schedule": "🗓️",
     "admin": "🛠️",
+    "steam": "🎮",
 }
 _DEFAULT_CATEGORY_EMOJI = "🔧"
 
