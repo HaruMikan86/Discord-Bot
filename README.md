@@ -1,6 +1,6 @@
 # PigeonPost-BOT
 
-統計・グラフ作成、リマインダー/ToDo、Googleカレンダー連携、Steam所持ゲーム確認ができる多機能Discord Botです。
+統計・グラフ作成、リマインダー/ToDo、Googleカレンダー連携、Steam所持ゲーム確認、ボドゲ・マダミスのランダム選択ができる多機能Discord Botです。
 Python / discord.py(スラッシュコマンド)で作られており、Renderの無料プランで常時稼働させる構成です。
 
 ## 機能一覧
@@ -15,6 +15,7 @@ Python / discord.py(スラッシュコマンド)で作られており、Render�
 | Googleカレンダー連携 | `/calendar connect` `status` `disconnect` `share` | OAuth認証での連携、空き状況の共有設定 |
 | 予定管理 | `/schedule add` `list` `remove` `freebusy` | Googleカレンダーの予定の登録・日付ごとの一覧・ドロップダウンでの削除・相手の空き状況確認 |
 | Steam連携 | `/steam link` `unlink` `games` `common` | 所持ゲームの確認、ボイスチャンネル内メンバーの共通所持ゲーム表示 |
+| ランダムピック | `/pick boardgame` `madamis` | 所持しているボードゲーム・マダミスのリスト(CSV)から、人数・時間で絞り込んでランダムに選ぶ |
 | 管理者向け | `/admin calendar_status` | 全員のカレンダー連携・共有状況の確認(Botの所有者のみ実行可能) |
 
 ## 環境変数
@@ -60,6 +61,23 @@ python main.py
 
 要求するスコープは `calendar.events`(予定の読み書き)と `calendar.freebusy`(空き状況のみの閲覧)の2つです。
 
+## ボドゲ・マダミスのリストについて
+
+`/pick` は、リポジトリ直下の `boardgames.csv`(ボードゲーム)と `madamis.csv`(マダミス)から選びます。
+中身を変えたいときは、CSVを編集してコミットし、再デプロイしてください(DBではなくリポジトリに含めているため、再デプロイしても消えません)。
+
+| ファイル | 列 |
+| --- | --- |
+| `boardgames.csv` | `タイトル,人数,時間` |
+| `madamis.csv` | `タイトル,人数,時間,済` |
+
+- **人数**: `3-5`(3〜5人)、`2`(2人ちょうど)、`4+1`(プレイヤー4人+ゲームマスター1人。人数の絞り込みではGMも含めた5人として扱う)、`+1`(拡張セットなど。単体では遊べないため抽選の対象外)
+- **時間**: `30分`、`40-60分`(幅がある場合、時間の絞り込みは長い方で判定)、`3時間`、`2時間30分`
+- **済**(マダミスのみ): `TRUE` ならプレイ済み。空欄・`FALSE` は未プレイ扱い。`/pick madamis` は既定でプレイ済みを除きます
+- 文字コードはUTF-8を推奨(ExcelのCSV形式で保存したShift-JISでも読み込めます)
+- 書式が不正な行はスキップされ、Botのログに理由が出力されます(`/pick` の結果のフッターにも件数が表示されます)
+- このリポジトリが公開の場合、リストの内容も公開されます
+
 ## データの保存について
 
 リマインダー・ToDo・Googleのリフレッシュトークン・Steamの紐付け情報は、SQLite(`data/bot.db`)に保存されます。
@@ -82,5 +100,7 @@ python main.py
 | `productivity.py` | リマインダー・ToDoの保存処理、日時・時間指定のパース |
 | `google_calendar.py` | Googleカレンダー連携(OAuth認証、予定の読み書き、空き状況) |
 | `steam_integration.py` | Steam連携(アカウント紐付け、所持ゲームの取得) |
+| `game_picker.py` | ボドゲ・マダミスのCSV読み込み、人数・時間の絞り込み、ランダム抽選 |
+| `boardgames.csv` / `madamis.csv` | `/pick` が読み込む所持リスト |
 | `keep_alive.py` | 死活監視用のFlaskサーバー、Google OAuthのコールバック(`/oauth2callback`) |
 | `Dockerfile` | Renderでの実行用 |
