@@ -39,6 +39,7 @@ from charts import (
 )
 from keep_alive import keep_alive
 import google_calendar
+import game_picker
 import productivity
 import steam_integration
 
@@ -1149,6 +1150,110 @@ bot.tree.add_command(steam_group)
 
 
 # ============================================================
+# /pick グループ: 所持しているボードゲーム・マダミスからランダムに選ぶ
+#
+# リストは boardgames.csv / madamis.csv(リポジトリ直下)から読み込む。
+# 内容を変えたいときはCSVを編集して再デプロイする(詳細は game_picker.py を参照)。
+# 「みんなで見て決める」用途なので、結果はチャンネルに公開する(ephemeralにしない)。
+# ============================================================
+
+pick_group = app_commands.Group(name="pick", description="所持しているボドゲ・マダミスからランダムに選びます")
+
+_PICK_MAX_COUNT = 10
+
+
+async def _run_pick(
+    interaction: discord.Interaction,
+    kind: str,
+    count: int,
+    players: Optional[int],
+    max_minutes: Optional[int],
+    include_played: bool,
+):
+    await interaction.response.defer()
+
+    is_madamis = kind == game_picker.KIND_MADAMIS
+    label = "マダミス" if is_madamis else "ボードゲーム"
+
+    try:
+        if is_madamis:
+            entries, errors = game_picker.load_madamis()
+        else:
+            entries, errors = game_picker.load_boardgames()
+    except game_picker.GameListError as e:
+        await interaction.followup.send(f"⚠️ {e}")
+        return
+
+    candidates = game_picker.filter_entries(
+        entries, players=players, max_minutes=max_minutes, include_played=include_played
+    )
+    conditions = game_picker.describe_conditions(
+        players, max_minutes, include_played if is_madamis else None
+    )
+
+    if not candidates:
+        hint = "プレイ済みも含めるか、" if is_madamis and not include_played else ""
+        await interaction.followup.send(
+            f"条件に合う{label}が見つかりませんでした({conditions})。{hint}人数・時間の条件をゆるめて試してみてください。"
+        )
+        return
+
+    picked = game_picker.pick(candidates, count)
+
+    lines = [f"{i}. {game_picker.format_entry(e)}" for i, e in enumerate(picked, start=1)]
+    description = "\n".join(lines)
+    if count > len(candidates):
+        description = f"条件に合うものが{len(candidates)}件しかなかったので、すべて表示します。\n\n" + description
+
+    embed = discord.Embed(
+        title=f"🎲 {label}ランダムピック",
+        description=description,
+        color=discord.Color.dark_magenta(),
+    )
+    footer = f"{conditions} ｜ 候補{len(candidates)}件から{len(picked)}件"
+    if errors:
+        footer += f" ｜ ⚠️ 読み込めなかった行: {len(errors)}件(Botのログを確認)"
+    embed.set_footer(text=footer)
+
+    await interaction.followup.send(embed=embed)
+
+
+@pick_group.command(name="boardgame", description="所持しているボードゲームからランダムに選びます")
+@app_commands.describe(
+    count=f"何件選ぶか(省略時: 1件、最大{_PICK_MAX_COUNT}件)",
+    players="遊ぶ人数(指定した人数で遊べるものだけから選びます)",
+    max_minutes="この時間(分)以内に終わるものだけから選びます(幅がある場合は長い方の時間で判定)",
+)
+async def pick_boardgame(
+    interaction: discord.Interaction,
+    count: app_commands.Range[int, 1, _PICK_MAX_COUNT] = 1,
+    players: Optional[app_commands.Range[int, 1, 30]] = None,
+    max_minutes: Optional[app_commands.Range[int, 1, 1440]] = None,
+):
+    await _run_pick(interaction, game_picker.KIND_BOARDGAME, count, players, max_minutes, include_played=True)
+
+
+@pick_group.command(name="madamis", description="所持しているマダミスのシナリオからランダムに選びます")
+@app_commands.describe(
+    count=f"何件選ぶか(省略時: 1件、最大{_PICK_MAX_COUNT}件)",
+    players="遊ぶ人数(GMが必要なシナリオは、GMも含めた人数で指定)",
+    max_minutes="この時間(分)以内に終わるものだけから選びます",
+    include_played="プレイ済み(済)のシナリオも候補に含めるか(省略時: 含めない)",
+)
+async def pick_madamis(
+    interaction: discord.Interaction,
+    count: app_commands.Range[int, 1, _PICK_MAX_COUNT] = 1,
+    players: Optional[app_commands.Range[int, 1, 30]] = None,
+    max_minutes: Optional[app_commands.Range[int, 1, 1440]] = None,
+    include_played: bool = False,
+):
+    await _run_pick(interaction, game_picker.KIND_MADAMIS, count, players, max_minutes, include_played)
+
+
+bot.tree.add_command(pick_group)
+
+
+# ============================================================
 # /help: 登録されているコマンドの一覧を自動生成して表示する
 #
 # 新しいコマンドを追加してもこのコードを触る必要はない。
@@ -1166,6 +1271,7 @@ _CATEGORY_EMOJIS = {
     "schedule": "🗓️",
     "admin": "🛠️",
     "steam": "🎮",
+    "pick": "🎲",
 }
 _DEFAULT_CATEGORY_EMOJI = "🔧"
 
