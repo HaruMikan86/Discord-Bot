@@ -1,0 +1,19 @@
+# --- Botのデータ(Googleのリフレッシュトークン等が入っているため、絶対にコミットしない) ---
+data/
+*.db
+*.sqlite3
+
+# --- 環境変数・秘密情報 ---
+.env
+.env.*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- エディタ・OS ---
+.vscode/
+.idea/
+.DS_Store
