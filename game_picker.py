@@ -3,7 +3,7 @@
 条件に合うものをランダムに選ぶためのモジュール。/pick 系のスラッシュコマンドから利用する。
 
 データはリポジトリ直下の CSV ファイルから読み込む(SQLiteには保存しない)。
-  - boardgames.csv : タイトル,人数,時間
+  - boardgames.csv : タイトル,人数,時間,評価,タグ
   - madamis.csv    : タイトル,人数,時間,済
 
 CSVはコミットしてデプロイすれば、Renderの再デプロイでも消えない(DBと違い、
@@ -11,8 +11,11 @@ CSVはコミットしてデプロイすれば、Renderの再デプロイでも�
 
 「人数」「時間」の書式:
   人数  "3-5"  3人から5人 / "2"  2人ちょうど / "4+1"  プレイヤー4人+ゲームマスター1人
+        "1~"   1人以上(上限なし) / "1,4"  1人または4人(カンマ区切りは「どれか」の意味)
         "+1"   拡張セットなど(単体では遊べないため、抽選の対象から外す)
   時間  "30分" / "40-60分"(幅がある場合は両方読み取る) / "3時間" / "2時間30分"
+  評価  0〜5の整数(ボードゲームのみ)。0は未プレイ。空欄も0(未プレイ)として扱う
+  タグ  今のところ使用していない(読み込まず、無視する)
 ExcelでCSV(コンマ区切り)として保存するとShift-JISになることがあるため、
 UTF-8で読めなければShift-JIS(cp932)でも読み込む。
 """
@@ -33,6 +36,10 @@ MADAMIS_CSV = BASE_DIR / "madamis.csv"
 KIND_BOARDGAME = "boardgame"
 KIND_MADAMIS = "madamis"
 
+OPEN_ENDED = 999  # 「1~」のような上限なしの人数を表す内部値
+RATING_UNPLAYED = 0  # 評価0 = 未プレイ
+RATING_MAX = 5
+
 
 class GameListError(ValueError):
     """リストの読み込みに失敗したときの例外(そのままユーザーに表示してよいメッセージ)"""
@@ -42,23 +49,27 @@ class GameListError(ValueError):
 class GameEntry:
     kind: str
     title: str
-    players_min: int
-    players_max: int
+    # 遊べるプレイヤー人数。(最少, 最多)の組を並べたもの。
+    # "3-5" → ((3, 5),) / "1,4" → ((1, 1), (4, 4)) / "1~" → ((1, OPEN_ENDED),)
+    player_ranges: Tuple[Tuple[int, int], ...]
     gm: int  # ゲームマスターが別に必要な人数(マダミスの「4+1」の+1)
     minutes_min: int
     minutes_max: int
     played: Optional[bool] = None  # マダミスの「済」。ボドゲはNone
     is_addon: bool = False  # 「+1」のみの行(拡張セット等)。抽選の対象にしない
+    rating: Optional[int] = None  # ボドゲの「評価」(0〜5、0は未プレイ)。マダミスはNone
 
     @property
-    def headcount_min(self) -> int:
-        """GMも含めて必要な最少人数"""
-        return self.players_min + self.gm
+    def players_min(self) -> int:
+        return min((lo for lo, _ in self.player_ranges), default=0)
 
     @property
-    def headcount_max(self) -> int:
-        """GMも含めて遊べる最大人数"""
-        return self.players_max + self.gm
+    def players_max(self) -> int:
+        return max((hi for _, hi in self.player_ranges), default=0)
+
+    def accepts_headcount(self, headcount: int) -> bool:
+        """GMも含めた人数 headcount で遊べるか"""
+        return any(lo + self.gm <= headcount <= hi + self.gm for lo, hi in self.player_ranges)
 
 
 # ============================================================
@@ -74,31 +85,42 @@ def _normalize_numeric_cell(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)  # 全角数字・全角プラスなどを半角に
     for ch in _DASHES:
         text = text.replace(ch, "-")
+    text = text.replace("、", ",")
     return re.sub(r"\s+", "", text)
 
 
-def parse_players(text: str) -> Tuple[int, int, int, bool]:
+def parse_players(text: str) -> Tuple[Tuple[Tuple[int, int], ...], int, bool]:
     """
-    戻り値: (最少人数, 最多人数, GM人数, 拡張セットか)
+    戻り値: (遊べる人数の範囲の組, GM人数, 拡張セットか)
+      "3-5"→(((3,5),),0,False) / "4+1"→(((4,4),),1,False)
+      "1~"→(((1,OPEN_ENDED),),0,False) / "1,4"→(((1,1),(4,4)),0,False) / "+1"→((),0,True)
     """
     s = _normalize_numeric_cell(text).replace("人", "")
     if not s:
         raise ValueError("人数が空です")
 
-    m = re.fullmatch(r"\+(\d+)", s)
-    if m:
-        return 0, 0, 0, True
+    if re.fullmatch(r"\+(\d+)", s):
+        return (), 0, True
 
-    m = re.fullmatch(r"(\d+)(?:-(\d+))?(?:\+(\d+))?", s)
-    if not m:
-        raise ValueError(f"人数「{text}」を読み取れません")
+    m = re.fullmatch(r"(.+?)(?:\+(\d+))?", s)
+    body, gm = m.group(1), int(m.group(2)) if m.group(2) else 0
 
-    low = int(m.group(1))
-    high = int(m.group(2)) if m.group(2) else low
-    gm = int(m.group(3)) if m.group(3) else 0
-    if low < 1 or high < low:
-        raise ValueError(f"人数「{text}」が不正です")
-    return low, high, gm, False
+    ranges = []
+    for part in body.split(","):
+        pm = re.fullmatch(r"(\d+)(?:(-)(\d+)?)?", part)
+        if not pm:
+            raise ValueError(f"人数「{text}」を読み取れません")
+        low = int(pm.group(1))
+        if pm.group(2) is None:
+            high = low  # "2" → 2人ちょうど
+        elif pm.group(3) is None:
+            high = OPEN_ENDED  # "1-"(元は「1~」) → 1人以上
+        else:
+            high = int(pm.group(3))
+        if low < 1 or high < low:
+            raise ValueError(f"人数「{text}」が不正です")
+        ranges.append((low, high))
+    return tuple(ranges), gm, False
 
 
 def parse_minutes(text: str) -> Tuple[int, int]:
@@ -127,6 +149,16 @@ def parse_minutes(text: str) -> Tuple[int, int]:
 def parse_played(text: str) -> bool:
     """「済」列。TRUE/済/○などを済とみなす(空欄・FALSEは未プレイ扱い)"""
     return unicodedata.normalize("NFKC", text).strip().upper() in ("TRUE", "1", "YES", "済", "○", "〇", "✓", "✔")
+
+
+def parse_rating(text: str) -> int:
+    """「評価」列。0〜5の整数(0は未プレイ)。空欄は未プレイ(0)として扱う"""
+    s = unicodedata.normalize("NFKC", text).strip()
+    if not s:
+        return RATING_UNPLAYED
+    if not re.fullmatch(r"[0-5]", s):
+        raise ValueError(f"評価「{text}」は0〜5の整数で指定してください")
+    return int(s)
 
 
 # ============================================================
@@ -169,11 +201,14 @@ def _load(path: Path, kind: str) -> Tuple[List[GameEntry], List[str]]:
             continue  # 空行は無視
 
         try:
-            p_min, p_max, gm, is_addon = parse_players(row.get("人数") or "")
+            ranges, gm, is_addon = parse_players(row.get("人数") or "")
             if is_addon:
                 m_min = m_max = 0
             else:
                 m_min, m_max = parse_minutes(row.get("時間") or "")
+            rating = None
+            if kind == KIND_BOARDGAME and "評価" in fieldnames:
+                rating = parse_rating(row.get("評価") or "")
         except ValueError as e:
             errors.append(f"{path.name} {line_no}行目「{title}」: {e}")
             continue
@@ -183,13 +218,13 @@ def _load(path: Path, kind: str) -> Tuple[List[GameEntry], List[str]]:
             GameEntry(
                 kind=kind,
                 title=title,
-                players_min=p_min,
-                players_max=p_max,
+                player_ranges=ranges,
                 gm=gm,
                 minutes_min=m_min,
                 minutes_max=m_max,
                 played=played,
                 is_addon=is_addon,
+                rating=rating,
             )
         )
 
@@ -215,23 +250,31 @@ def filter_entries(
     players: Optional[int] = None,
     max_minutes: Optional[int] = None,
     include_played: bool = True,
+    min_rating: Optional[int] = None,
+    max_rating: Optional[int] = None,
 ) -> List[GameEntry]:
     """
     players      : 遊ぶ人数。GMが必要なものは、GMも含めた人数で判定する
     max_minutes  : この時間以内に終わるもの。「40-60分」のように幅がある場合は、
                    長い方(60分)で判定する(確実に収まるものだけを残す)
     include_played: Falseなら、プレイ済み(済=TRUE)のマダミスを除く
+    min_rating / max_rating: ボドゲの評価(0〜5、0は未プレイ)の下限・上限(両端を含む)。
+                   評価の列が無いなど、評価が分からないものは、指定があれば除外する
     拡張セット(「+1」のみの行)は単体で遊べないため、常に除外する。
     """
     result = []
     for e in entries:
         if e.is_addon:
             continue
-        if players is not None and not (e.headcount_min <= players <= e.headcount_max):
+        if players is not None and not e.accepts_headcount(players):
             continue
         if max_minutes is not None and e.minutes_max > max_minutes:
             continue
         if not include_played and e.played:
+            continue
+        if min_rating is not None and (e.rating is None or e.rating < min_rating):
+            continue
+        if max_rating is not None and (e.rating is None or e.rating > max_rating):
             continue
         result.append(e)
     return result
@@ -246,8 +289,14 @@ def pick(entries: List[GameEntry], count: int, rng=random) -> List[GameEntry]:
 # 表示用の整形
 # ============================================================
 
+def _format_player_range(lo: int, hi: int) -> str:
+    if hi >= OPEN_ENDED:
+        return f"{lo}人〜"
+    return f"{lo}人" if lo == hi else f"{lo}〜{hi}人"
+
+
 def format_players(e: GameEntry) -> str:
-    base = f"{e.players_min}人" if e.players_min == e.players_max else f"{e.players_min}〜{e.players_max}人"
+    base = "、".join(_format_player_range(lo, hi) for lo, hi in e.player_ranges)
     return f"{base}+GM{e.gm}" if e.gm else base
 
 
@@ -269,14 +318,37 @@ def format_entry(e: GameEntry) -> str:
     return f"**{e.title}**\n　{detail}"
 
 
+def describe_rating(min_rating: Optional[int], max_rating: Optional[int]) -> Optional[str]:
+    """評価の絞り込み条件を、フッター表示用の短い文にする(指定が無ければNone)"""
+    if min_rating is None and max_rating is None:
+        return None
+    lo = 0 if min_rating is None else min_rating
+    hi = RATING_MAX if max_rating is None else max_rating
+    if hi == RATING_UNPLAYED:
+        return "未プレイのみ"
+    if lo == hi:
+        return f"評価{lo}のみ"
+    if hi == RATING_MAX:
+        return f"評価{lo}以上"
+    note = "(未プレイを含む)" if lo == RATING_UNPLAYED else ""
+    return f"評価{lo}〜{hi}{note}"
+
+
 def describe_conditions(
-    players: Optional[int], max_minutes: Optional[int], include_played: Optional[bool] = None
+    players: Optional[int],
+    max_minutes: Optional[int],
+    include_played: Optional[bool] = None,
+    min_rating: Optional[int] = None,
+    max_rating: Optional[int] = None,
 ) -> str:
     parts = []
     if players is not None:
         parts.append(f"人数: {players}人")
     if max_minutes is not None:
         parts.append(f"{max_minutes}分以内")
+    rating_text = describe_rating(min_rating, max_rating)
+    if rating_text:
+        parts.append(rating_text)
     if include_played:
         parts.append("プレイ済みを含む")
     return " ／ ".join(parts) if parts else "条件なし"
