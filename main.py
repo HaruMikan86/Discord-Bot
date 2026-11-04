@@ -1169,8 +1169,16 @@ async def _run_pick(
     players: Optional[int],
     max_minutes: Optional[int],
     include_played: bool,
+    min_rating: Optional[int] = None,
+    max_rating: Optional[int] = None,
 ):
     await interaction.response.defer()
+
+    if min_rating is not None and max_rating is not None and min_rating > max_rating:
+        await interaction.followup.send(
+            f"⚠️ 評価の下限({min_rating})が上限({max_rating})より大きくなっています。"
+        )
+        return
 
     is_madamis = kind == game_picker.KIND_MADAMIS
     label = "マダミス" if is_madamis else "ボードゲーム"
@@ -1185,10 +1193,19 @@ async def _run_pick(
         return
 
     candidates = game_picker.filter_entries(
-        entries, players=players, max_minutes=max_minutes, include_played=include_played
+        entries,
+        players=players,
+        max_minutes=max_minutes,
+        include_played=include_played,
+        min_rating=min_rating,
+        max_rating=max_rating,
     )
     conditions = game_picker.describe_conditions(
-        players, max_minutes, include_played if is_madamis else None
+        players,
+        max_minutes,
+        include_played if is_madamis else None,
+        min_rating,
+        max_rating,
     )
 
     if not candidates:
@@ -1223,14 +1240,27 @@ async def _run_pick(
     count=f"何件選ぶか(省略時: 1件、最大{_PICK_MAX_COUNT}件)",
     players="遊ぶ人数(指定した人数で遊べるものだけから選びます)",
     max_minutes="この時間(分)以内に終わるものだけから選びます(幅がある場合は長い方の時間で判定)",
+    min_rating="評価がこの値以上のものだけ(0〜5。0は未プレイなので、1以上にすると遊んだことのあるものだけ)",
+    max_rating="評価がこの値以下のものだけ(0〜5。0を指定すると未プレイのものだけ)",
 )
 async def pick_boardgame(
     interaction: discord.Interaction,
     count: app_commands.Range[int, 1, _PICK_MAX_COUNT] = 1,
     players: Optional[app_commands.Range[int, 1, 30]] = None,
     max_minutes: Optional[app_commands.Range[int, 1, 1440]] = None,
+    min_rating: Optional[app_commands.Range[int, 0, 5]] = None,
+    max_rating: Optional[app_commands.Range[int, 0, 5]] = None,
 ):
-    await _run_pick(interaction, game_picker.KIND_BOARDGAME, count, players, max_minutes, include_played=True)
+    await _run_pick(
+        interaction,
+        game_picker.KIND_BOARDGAME,
+        count,
+        players,
+        max_minutes,
+        include_played=True,
+        min_rating=min_rating,
+        max_rating=max_rating,
+    )
 
 
 @pick_group.command(name="madamis", description="所持しているマダミスのシナリオからランダムに選びます")
